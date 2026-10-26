@@ -74,9 +74,30 @@
 ## Action item → правило перевірки (Task D)
 
 - **Action item:** #1
-- **Правило:** `<ID>` у `tools/check-deploy.mjs` — _буде додано в Task D_: кожна змінна в
-  `environment:` сервісів `deploy/compose.yaml` має читатися кодом застосунку.
-- **Тест:** _Task D_ — compose з `DB_POOL_SIZE` (ситуація з інциденту) → FAIL; коректна
-  конфігурація з системною `TZ`, якої код не читає, → PASS.
-- **Чому воно ловить клас проблем, а не лише цей інцидент:** _Task D_.
+- **Правило:** `E1` у `tools/check-deploy.mjs` — кожна змінна в `environment:` сервісів
+  застосунку в `deploy/compose.yaml` має бути серед тих, що читає `app/src/config.js`
+  (`env.NAME` / `env["NAME"]`), або бути системною (`TZ`, `NODE_ENV`, `NODE_OPTIONS`…).
+  Список назв правило бере з самого `config.js`, а не з копії всередині перевірки.
+- **Тест:** `tools/test/env-names.test.mjs` (`npm run test:tools`):
+  - **FAIL** — environment v1.8.0 з `incident/changes/v1.8.0.diff` (`DB_POOL_SIZE` в api і
+    worker); та сама помилка у list-формі (`SMS_RATE_PERSEC=8`) і за YAML-якорем `<<: *env`;
+  - **PASS** — коректна конфігурація, до якої наївне правило «усе в compose має бути в
+    config.js» причепилося б: системні `TZ`/`NODE_ENV`, list-форма з голим `SMS_TOKEN`,
+    сайдкар `postgres` з власним `POSTGRES_PASSWORD` (сторонній образ правило не судить);
+    плюс справжній `deploy/compose.yaml` репо;
+  - **SKIP** — немає `app/src/config.js`.
+  - Перевірено й наживо: compose з `main` з перейменуванням `DB_POOL_MAX → DB_POOL_SIZE` →
+    `E1 FAIL … api: DB_POOL_SIZE; worker: DB_POOL_SIZE`.
+- **Чому воно ловить клас проблем, а не лише цей інцидент:** правило не знає про
+  `DB_POOL_*` — воно порівнює дві сторони контракту «конфіг ↔ код». Будь-яке перейменування,
+  одруківка (`SMS_RATE_PERSEC`), змінна, яку код перестав читати, або нова змінна, яку
+  забули додати в `config.js`, — FAIL до деплою. Усі такі помилки мають однаковий наслідок:
+  застосунок мовчки бере значення за замовчуванням (`Number(env.X) || default`), тож
+  `/health` зелений, а поведінка в продакшні інша.
+- **Чого правило не ловить (свідомо):** зворотний напрям — змінної, яку код читає, немає в
+  compose. Наприклад, перша чернетка AI в Task D через неглибокий `<<: *common` залишила
+  `api` лише з `PORT` (без `DB_POOL_MAX`, `DATABASE_URL`, `SMS_TOKEN`) — E1 її пропускає, бо
+  `PORT` код читає. `DATABASE_URL`/`SMS_TOKEN` тепер ловить сам compose через `${VAR:?…}`, а
+  для решти потрібен action item #2: падати при старті без критичних змінних, а не брати
+  значення за замовчуванням.
 

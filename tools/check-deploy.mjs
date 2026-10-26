@@ -370,6 +370,35 @@ export function imageProblem(image) {
 const isNoneTest = (t) => (Array.isArray(t) ? String(t[0]).toUpperCase() === "NONE" : typeof t === "string" && t.trim().toUpperCase() === "NONE");
 const healthcheckOff = (hc) => hc?.disable === true || isNoneTest(hc?.test);
 
+// ---------------------------------------------------------------- E1: env names the app reads
+
+export const APP_CONFIG = "app/src/config.js";
+
+// Read by Node.js / the OS inside the container, not by app/src/config.js.
+export const RUNTIME_ENV = new Set(["TZ", "NODE_ENV", "NODE_OPTIONS", "NODE_EXTRA_CA_CERTS", "LANG", "LC_ALL"]);
+
+/** Environment variable names that app/src/config.js reads: env.NAME or env["NAME"]. */
+export function configEnvNames(text) {
+  const names = new Set();
+  for (const m of String(text).matchAll(/\benv\.([A-Za-z_][A-Za-z0-9_]*)|\benv\[\s*["']([A-Za-z_][A-Za-z0-9_]*)["']\s*\]/g)) {
+    names.add(m[1] ?? m[2]);
+  }
+  return names;
+}
+
+/**
+ * Services that run the app's image: those built from the repo (build:) and those using
+ * the same image: string as a built one. A third-party image (postgres, redis…) has its
+ * own variables and is not judged against app/src/config.js. No build: anywhere → all.
+ */
+function appServices(compose) {
+  const all = services(compose);
+  const built = all.filter(([, svc]) => svc?.build);
+  if (!built.length) return all;
+  const images = new Set(built.map(([, svc]) => svc?.image).filter(Boolean).map(String));
+  return all.filter(([, svc]) => svc?.build || (svc?.image && images.has(String(svc.image))));
+}
+
 // ---------------------------------------------------------------- rules
 
 // A one-shot job (e.g. a nightly script run by `docker compose run`): no ports and an explicit
@@ -621,6 +650,34 @@ export const RULES = [
         }
       }
       return problems.length ? fail(`не закріплено: ${problems.join("; ")}`) : pass(`закріплено: ${count}`);
+    },
+  },
+  {
+    // Post-mortem 2026-10-14, action item #1: v1.8.0 renamed DB_POOL_MAX → DB_POOL_SIZE in
+    // compose; config.js reads only DB_POOL_MAX and silently fell back to a pool of 4.
+    id: "E1",
+    title: "Кожну змінну environment: сервісів застосунку читає app/src/config.js",
+    hint: "Назва змінної в compose має збігатися з env.NAME в app/src/config.js — інакше застосунок її не бачить і мовчки бере значення за замовчуванням (так 2026-10-14 DB_POOL_SIZE замість DB_POOL_MAX дав пул 4 замість 20). Перейменовуєте змінну — перейменуйте і в config.js. Системні TZ, NODE_ENV, NODE_OPTIONS дозволені; сервіси зі стороннім образом (postgres тощо) не перевіряються.",
+    check(ctx) {
+      const problem = composeProblem(ctx.compose);
+      if (problem) return problem;
+      let configText = ctx.appConfig;
+      if (configText === undefined) {
+        const full = join(ctx.root, APP_CONFIG);
+        configText = existsSync(full) ? readFileSync(full, "utf8") : null;
+      }
+      if (configText === null) return skip(`${APP_CONFIG} не знайдено — немає з чим порівнювати`);
+      const known = configEnvNames(configText);
+      const problems = [];
+      let checked = 0;
+      for (const [name, svc] of appServices(ctx.compose)) {
+        for (const [key] of envEntries(svc?.environment)) {
+          checked += 1;
+          if (!known.has(key) && !RUNTIME_ENV.has(key)) problems.push(`${name}: ${key}`);
+        }
+      }
+      if (problems.length) return fail(`${APP_CONFIG} цих змінних не читає: ${problems.join("; ")}`);
+      return pass(`усі ${checked} змінних сервісів застосунку читає ${APP_CONFIG} або рантайм`);
     },
   },
 ];
