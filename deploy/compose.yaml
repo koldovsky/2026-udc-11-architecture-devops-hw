@@ -1,35 +1,96 @@
-# Поштомат громади — продакшн на одній VM (docker compose up -d).
-# PostgreSQL працює на самій VM, поза compose.
+# Поштомат громади — продакшн на одній VM. PostgreSQL працює на самій VM, поза compose.
+#
+# Образ на VM не збирається: його збирає CI (pipeline/deploy.yml), пушить у реєстр,
+# а сюди передає за digest. Секрети й посилання на образ — у файлі .env поруч
+# (права 600, його пише деплой), у git їх немає:
+#
+#   POSHTOMAT_IMAGE=ghcr.io/<owner>/<repo>:sha-<коміт>@sha256:...
+#   DATABASE_URL='postgres://poshtomat:<пароль>@192.0.2.10:5432/poshtomat'
+#   SMS_TOKEN='<токен SMS-провайдера>'
+#
+# Запуск:        docker compose -p poshtomat --env-file .env up -d --remove-orphans
+#                docker compose -p poshtomat --env-file .env up -d --wait --wait-timeout 120 api
+#                (--wait лише для api: у worker перевірку вимкнено, і Compose v2.26.1 на
+#                 `up --wait` для всіх сервісів дає exit 1 — docs/task-e-bonus.md)
+# Нічна задача:  docker compose -p poshtomat --env-file .env run --rm expire   (з cron)
+
+x-env: &env
+  TZ: "Europe/Kyiv"
+  LOG_LEVEL: "info"
+  DATABASE_URL: "${DATABASE_URL:?DATABASE_URL не задано в .env}"
+  DB_POOL_MAX: "20"
+  DB_POOL_WAIT_MS: "2000"
+  SMS_BASE_URL: "https://sms.example.net/api/v2"
+  SMS_TOKEN: "${SMS_TOKEN:?SMS_TOKEN не задано в .env}"
+  SMS_RATE_PER_SEC: "8"  # ліміт провайдера 10/с, понад це 429; 8 — запас 20 % (ADR 0001, Р3). Було 20
+  COURIER_BASE_URL: "https://courier.example.com/api/v1"
+
+x-app: &app
+  image: "${POSHTOMAT_IMAGE:?POSHTOMAT_IMAGE не задано в .env}"
+  restart: unless-stopped
+  # tini як PID 1: пересилає SIGTERM процесу node і прибирає зомбі-процеси.
+  init: true
+  read_only: true
+  tmpfs:
+    - /tmp:size=16m
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+  # Обидва процеси завершуються по SIGTERM самі (worker — після поточного раунду й
+  # паузи до 10 с), тож даємо їм на це більше за типові 10 с.
+  stop_grace_period: 30s
+  # Без ротації json-логи контейнерів рано чи пізно займуть увесь диск VM.
+  logging:
+    driver: json-file
+    options:
+      max-size: "20m"
+      max-file: "5"
+
 services:
   api:
-    image: poshtomat:latest
-    build:
-      context: ../app
-      dockerfile: ../deploy/Dockerfile
+    <<: *app
+    command: ["node", "src/server.js"]
+    # Порт відкритий назовні: до API звертаються поштомати й сканери служби доставки.
     ports:
       - "8080:8080"
     environment:
-      TZ: "Europe/Kyiv"
+      <<: *env
       PORT: "8080"
-      LOG_LEVEL: "info"
-      DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
-      DB_POOL_MAX: "20"
-      DB_POOL_WAIT_MS: "2000"
-      SMS_BASE_URL: "https://sms.example.net/api/v2"
-      SMS_TOKEN: "CHANGE_ME"
-      SMS_RATE_PER_SEC: "20"
-      COURIER_BASE_URL: "https://courier.example.com/api/v1"
+    # healthcheck — з образу (HEALTHCHECK у deploy/Dockerfile): GET /health; на нього
+    # чекає `up --wait` під час деплою.
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          pids: 256
 
   worker:
-    image: poshtomat:latest
+    <<: *app
     command: ["node", "src/worker.js"]
-    environment:
-      TZ: "Europe/Kyiv"
-      LOG_LEVEL: "info"
-      DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
-      DB_POOL_MAX: "20"
-      DB_POOL_WAIT_MS: "2000"
-      SMS_BASE_URL: "https://sms.example.net/api/v2"
-      SMS_TOKEN: "CHANGE_ME"
-      SMS_RATE_PER_SEC: "20"
-      COURIER_BASE_URL: "https://courier.example.com/api/v1"
+    environment: *env
+    # HTTP-сервера у worker немає, тож HTTP-перевірка з образу завжди падала б.
+    # Власного сигналу здоров'я worker не має; якщо процес впаде, його підніме restart.
+    healthcheck:
+      disable: true
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          pids: 128
+
+  # Нічна задача (повернення посилок, що пролежали понад 72 години). Не стартує з
+  # `up`, лише через `run --rm expire` — з cron на VM.
+  expire:
+    <<: *app
+    profiles: [jobs]
+    restart: "no"
+    command: ["node", "bin/expire-parcels.js"]
+    environment: *env
+    # Разова задача без HTTP: перевірка з образу їй не потрібна.
+    healthcheck:
+      disable: true
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          pids: 128

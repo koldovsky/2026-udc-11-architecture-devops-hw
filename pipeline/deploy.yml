@@ -1,0 +1,295 @@
+# Поштомат громади: тести → збірка образу → деплой на VM з ручним погодженням.
+#
+# Щоб GitHub його запускав, файл має лежати в .github/workflows/deploy.yml.
+#
+# Що налаштувати в репозиторії (Settings → Environments → production):
+#   - Required reviewers — саме це вмикає ручне погодження; без них `environment:`
+#     нічого не зупиняє.
+#   - Deployment branches: лише main.
+#   - Environment secrets (не repository secrets — тоді їх бачить лише job деплою
+#     і лише після погодження):
+#       DEPLOY_HOST          адреса VM
+#       DEPLOY_USER          користувач для SSH (у групі docker, власник /opt/poshtomat)
+#       DEPLOY_SSH_KEY       приватний ключ лише для деплою
+#       DEPLOY_KNOWN_HOSTS   рядок(и) з `ssh-keyscan <host>`, звірені з ключем VM
+#       DATABASE_URL         postgres://poshtomat:<пароль>@192.0.2.10:5432/poshtomat
+#       SMS_TOKEN            токен SMS-провайдера
+#
+# Відкат: якщо новий реліз не проходить перевірок, скрипт сам повертає попередній. Інакше —
+# на VM із .prev-файлів (docs/runbook.md, «Що робити», рядок 1) або `git revert` у main:
+# це новий коміт-голова, і він іде звичайним шляхом. «Re-run» старого запуску відкатом не є —
+# його зупинить перевірка «Коміт досі голова main».
+
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Усе вимкнено за замовчуванням; кожен job просить лише те, що йому потрібно.
+permissions: {}
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+
+      - name: Тести
+        working-directory: app
+        run: npm test
+
+      # P1: кожна змінна застосунку з deploy/compose.yaml читається в config.js
+      # (docs/postmortem.md, action item #1) — до збірки образу, а не після інциденту.
+      - name: Перевірка конфігурації деплою
+        run: npm run check:deploy
+
+  build:
+    needs: test
+    # PR і запуски з інших гілок лише тестуються, образ не пушиться.
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      # тег — щоб у .env, логах і `docker ps` було видно коміт; digest — гарантія, що саме
+      # цей образ (тег можна перезаписати, digest — ні; Docker тягне за digest)
+      image: ${{ steps.ref.outputs.repo }}:sha-${{ github.sha }}@${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Імена в ghcr.io мають бути в нижньому регістрі.
+      - name: Ім'я образу
+        id: ref
+        run: echo "repo=${REGISTRY}/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Збірка й публікація
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: app
+          file: deploy/Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.ref.outputs.repo }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    # Тут job чекає на погодження reviewer'а з environment production.
+    environment: production
+    # Два деплої одночасно не йдуть; наступний чекає, поточний не скасовується.
+    concurrency:
+      group: production-deploy
+      cancel-in-progress: false
+    permissions:
+      contents: read  # deploy/compose.yaml
+      packages: read  # VM тягне образ з ghcr.io короткоживучим GITHUB_TOKEN цього job
+    env:
+      DEPLOY_DIR: /opt/poshtomat
+      IMAGE: ${{ needs.build.outputs.image }}
+    steps:
+      # concurrency не гарантує порядок: старіший запуск, погоджений пізніше, розгорнув би
+      # свій образ поверх новішого. Тому деплоїмо лише голову main — і в повторних запусках
+      # (Re-run) теж: «Re-run failed jobs» на застарілому запуску інакше тихо повернув би
+      # прод на старий коміт.
+      - name: Коміт досі голова main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          head=$(curl -fsSL -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github.sha" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/commits/main")
+          if [ "$head" != "$GITHUB_SHA" ]; then
+            echo "::error::застарілий запуск: ${GITHUB_SHA} уже не голова main (${head}); не деплоїмо"
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: deploy/compose.yaml
+          sparse-checkout-cone-mode: false
+
+      - name: Налаштування SSH
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          (umask 077 && printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key)
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          # Ключ хоста лише з known_hosts: невідомий або змінений ключ = відмова.
+          cat > ~/.ssh/config <<EOF
+          Host vm
+            HostName ${DEPLOY_HOST}
+            User ${DEPLOY_USER}
+            IdentityFile ~/.ssh/deploy_key
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            BatchMode yes
+            ConnectTimeout 15
+          EOF
+
+      - name: Передача compose.yaml і .env на VM
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SMS_TOKEN: ${{ secrets.SMS_TOKEN }}
+        run: |
+          # Значення йдуть у .env в одинарних лапках (без підстановки $ у compose),
+          # тож лапок і переносів рядка в них бути не може.
+          for name in DATABASE_URL SMS_TOKEN; do
+            value="${!name}"
+            if [ -z "$value" ]; then echo "::error::секрет $name порожній"; exit 1; fi
+            case "$value" in *"'"*|*$'\n'*) echo "::error::секрет $name містить ' або перенос рядка"; exit 1;; esac
+          done
+
+          scp -q deploy/compose.yaml "vm:${DEPLOY_DIR}/compose.yaml.new"
+          # Секрети — через stdin, не в аргументах команди (їх видно в ps на VM)
+          # і не у файлі на runner'і.
+          printf "POSHTOMAT_IMAGE=%s\nDATABASE_URL='%s'\nSMS_TOKEN='%s'\n" \
+              "$IMAGE" "$DATABASE_URL" "$SMS_TOKEN" \
+            | ssh vm "umask 077 && cat > '${DEPLOY_DIR}/.env.new'"
+
+      - name: Вхід VM у ghcr.io
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" \
+            | ssh vm "docker login '${REGISTRY}' -u '${GITHUB_ACTOR}' --password-stdin" > /dev/null
+
+      - name: Розгортання
+        run: |
+          ssh vm bash -s -- "$DEPLOY_DIR" "$REGISTRY" <<'EOF'
+          set -euo pipefail
+          cd "$1"
+          dc() { docker compose -p poshtomat "$@"; }
+
+          # Нові файли перевіряються й образ тягнеться до того, як щось зміниться.
+          dc -f compose.yaml.new --env-file .env.new config --quiet
+          dc -f compose.yaml.new --env-file .env.new pull --quiet
+          # docker logout — лише в кроці «Прибирання», не тут: якщо попереднього образу на VM
+          # уже немає (наприклад, після prune), автовідкат стягне його сам через `up -d`.
+
+          had_prev=false
+          if [ -f .env ]; then
+            cp -p .env .env.prev
+            cp -p compose.yaml compose.yaml.prev
+            had_prev=true
+          fi
+          mv compose.yaml.new compose.yaml
+          mv .env.new .env
+
+          # /health не ходить у БД (app/src/server.js:37), тож healthy ще не означає, що API
+          # працює. Той самий пробний запит, що й у runbook («Перші 5 хвилин», крок 2):
+          # неіснуючий токен API перевіряє в БД через пул і відповідає 403. Неправильний
+          # DATABASE_URL чи недоступна БД дадуть 500/503 або тайм-аут 2 с. Це контракт
+          # продакшну: там за інтерфейсом пулу стоїть PostgreSQL (app/src/db.js:1-2). У репо
+          # БД немає: createPool викликається без config.dbUrl (app/src/server.js, main),
+          # DATABASE_URL ніде не використовується, сховище в пам'яті. Тож проба дає 403 завжди,
+          # а як перевірка БД має сенс лише тоді, коли розгорнутий застосунок справді працює з
+          # PostgreSQL (припущення моделі; образ, зібраний з цього app/, — ні).
+          db_probe() {
+            dc --env-file .env exec -T api node -e "fetch('http://127.0.0.1:' + (process.env.PORT || 8080) + '/admin/parcels', { headers: { authorization: 'Bearer probe' }, signal: AbortSignal.timeout(2000) }).then(r => { console.log('проба БД:', r.status); process.exit(r.status === 403 ? 0 : 1); }, e => { console.log('проба БД:', e.message); process.exit(1); })"
+          }
+
+          # Старт усіх сервісів, потім очікування healthy лише для api: у worker перевірку
+          # вимкнено, і Compose v2.26.1 на `up --wait` для всіх сервісів дає exit 1
+          # («has no healthcheck configured»), хоча все працює (docs/task-e-bonus.md).
+          # Healthcheck у worker немає, тож перевіряємо інакше: лічильник перезапусків
+          # беремо одразу після старту, і через WORKER_WINDOW с worker має бути running з тим
+          # самим лічильником. Docker скидає паузу між перезапусками після 10 с роботи, тож
+          # цикл «працює 25 с — падає» за 60 с дасть щонайменше один перезапуск.
+          # Живий процес ще не означає, що worker працює: помилку раунду (наприклад, тайм-аут
+          # пулу БД) worker лише пише в лог і йде на наступний раунд (app/src/worker.js:60-64).
+          # Тому за те саме вікно (~6 раундів по 10 с) у лозі не має бути `notify round failed`.
+          # `sms send failed` не рахуємо: поодинокі 429 і TLS-тайм-аути бувають щодня.
+          WORKER_WINDOW=60
+          up_and_wait() {
+            local id before since t0 left after logs failed
+            dc --env-file .env up -d --remove-orphans || return 1
+            id=$(dc --env-file .env ps -a -q worker)
+            [ -n "$id" ] || { echo "worker не запущено"; return 1; }
+            before=$(docker inspect -f '{{.RestartCount}}' "$id")
+            since=$(date +%s)
+            t0=$SECONDS
+            dc --env-file .env up -d --wait --wait-timeout 120 api || return 1
+            db_probe || return 1
+            left=$((WORKER_WINDOW - (SECONDS - t0)))
+            if [ "$left" -gt 0 ]; then sleep "$left"; fi
+            after=$(docker inspect -f '{{.State.Status}} {{.RestartCount}}' "$id")
+            [ "$after" = "running $before" ] || { echo "worker нестабільний: $after (було $before)"; return 1; }
+            logs=$(docker logs --since "$since" "$id" 2>&1) || { echo "не вдалося прочитати лог worker"; return 1; }
+            failed=$(printf '%s\n' "$logs" | grep '"msg":"notify round failed"' || true)
+            [ -z "$failed" ] || { echo "worker не обробляє раунди: $(printf '%s\n' "$failed" | wc -l) × notify round failed"; printf '%s\n' "$failed" | tail -3; return 1; }
+          }
+
+          if up_and_wait; then
+            echo "Розгорнуто: $(grep '^POSHTOMAT_IMAGE=' .env | cut -d= -f2-)"
+            exit 0
+          fi
+
+          echo "::error::новий реліз не пройшов перевірок"
+          dc --env-file .env logs --tail 100 api worker || true
+          # Файли невдалого релізу лишаються для розбору (.failed), а не зникають.
+          cp -p compose.yaml compose.yaml.failed
+          cp -p .env .env.failed
+          if ! $had_prev; then
+            echo "::error::попереднього релізу немає (перший деплой) — відкочувати нема на що; зупиняю новий"
+            # Не down: зупинені контейнери лишаються для `logs`, але порт закрито і worker не шле SMS.
+            dc --env-file .env stop api worker || true
+            # Активних файлів не лишаємо (лише .failed): інакше наступний деплой збереже цей
+            # поганий реліз як .prev, і його автовідкат повернув би саме його.
+            mv compose.yaml compose.yaml.failed
+            mv .env .env.failed
+            exit 1
+          fi
+          echo "Повертаю попередній реліз: $(grep '^POSHTOMAT_IMAGE=' .env.prev | cut -d= -f2-)"
+          mv compose.yaml.prev compose.yaml
+          mv .env.prev .env
+          if up_and_wait; then
+            echo "::error::відкат вдався, працює попередній реліз; новий — у compose.yaml.failed і .env.failed"
+          else
+            echo "::error::ВІДКАТ НЕ ВДАВСЯ: попередній реліз не пройшов перевірок (фактичний стан — ps -a нижче) — ескалюйте (docs/runbook.md)"
+            dc --env-file .env ps -a || true
+          fi
+          exit 1
+          EOF
+
+      - name: Прибирання
+        if: always()
+        run: |
+          ssh vm "docker logout '${REGISTRY}'; rm -f '${DEPLOY_DIR}/.env.new' '${DEPLOY_DIR}/compose.yaml.new'" > /dev/null 2>&1 || true
+          rm -f ~/.ssh/deploy_key
