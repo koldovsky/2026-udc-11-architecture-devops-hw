@@ -1,0 +1,266 @@
+# Поштомат громади: тести → збірка образу → деплой на VM з ручним погодженням.
+#
+# Щоб GitHub його запускав, файл має лежати в .github/workflows/deploy.yml.
+#
+# Налаштування репозиторію (Settings → Environments → production):
+#   - Required reviewers: хто погоджує деплой; Deployment branches: лише main.
+#   - Environment secrets (недоступні job до погодження):
+#       DEPLOY_HOST          адреса VM
+#       DEPLOY_USER          користувач на VM із доступом до docker
+#       DEPLOY_SSH_KEY       приватний ключ (окремий, лише для деплою)
+#       DEPLOY_KNOWN_HOSTS   рядок(и) known_hosts для VM: `ssh-keyscan -t ed25519 <host>`,
+#                            звірений з відбитком на самій VM
+#       DATABASE_URL         рядок підключення до PostgreSQL
+#       SMS_TOKEN            токен SMS-провайдера
+#
+# Екшени сторонніх авторів не використовуються; actions/checkout варто закріпити за
+# commit SHA (Dependabot для github-actions оновлюватиме його).
+#
+# Перший деплой за цією схемою — міграція зі старого стеку (/opt/poshtomat/repo,
+# `docker compose -f deploy/compose.yaml`): його треба один раз зупинити вручну, бо він
+# тримає порт 8080, а автовідкату на першому деплої немає (ще немає *.prev).
+
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Усе заборонено за замовчуванням; кожен job просить лише своє.
+permissions: {}
+
+# Два деплої одночасно на одну VM не йдуть; той, що в черзі, не скасовує поточний.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    container: node:22-bookworm-slim
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Unit tests
+        working-directory: app
+        run: npm test
+      # Тести самого перевіряльника, зокрема E1 (tools/test/env-contract.test.mjs).
+      - name: Checker tests
+        run: npm run test:tools
+      # Правила check-deploy для Dockerfile і compose, зокрема E1: env у compose звіряється
+      # з app/src/config.js (action item #1 з docs/postmortem.md). W-правила виключено навмисно:
+      # вони читають workflow лише за шляхом pipeline/deploy.yml, а запущений workflow лежить у
+      # .github/workflows/deploy.yml, тож тут W1 упав би з «не знайдено». W1–W5 перевіряє
+      # `npm run check:deploy` до переносу файлу.
+      - name: Check deploy config
+        run: |
+          node --input-type=module -e 'import { RULES, runChecks, loadContext, formatReport } from "./tools/check-deploy.mjs"; const r = runChecks(loadContext("."), RULES.filter((x) => !x.id.startsWith("W"))); process.stdout.write(formatReport(r)); if (r.some((x) => x.status === "FAIL")) process.exitCode = 1;'
+
+  compose-check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Validate compose.yaml
+        working-directory: deploy
+        # Лише схема: значень ${…:?} тут немає, обов'язкові змінні перевіряє деплой на VM.
+        run: docker compose -f compose.yaml config --no-interpolate --quiet
+
+  build:
+    needs: [test, compose-check]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write          # push у GHCR через GITHUB_TOKEN, без довгоживучих токенів
+    outputs:
+      image: ${{ steps.push.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Log in to GHCR
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+
+      - name: Build and push
+        id: push
+        run: |
+          repo="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/poshtomat"
+          docker build --pull \
+            --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            -f deploy/Dockerfile -t "${repo}:${GITHUB_SHA}" app
+          docker push "${repo}:${GITHUB_SHA}"
+          # Деплоїмо за digest, а не за тегом: на VM потрапить саме те, що зібрано тут.
+          image="$(docker inspect --format '{{index .RepoDigests 0}}' "${repo}:${GITHUB_SHA}")"
+          echo "image=${image}" >> "$GITHUB_OUTPUT"
+          echo "Image: \`${image}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Log out of GHCR
+        if: always()
+        run: docker logout ghcr.io
+
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # Job чекає погодження reviewers з налаштувань environment.
+    environment:
+      name: production
+    permissions:
+      contents: read
+      packages: read           # VM тягне образ одноразовим GITHUB_TOKEN цього job
+    env:
+      IMAGE: ${{ needs.build.outputs.image }}
+      APP_DIR: /opt/poshtomat
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: deploy
+
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          install -d -m 700 ~/.ssh
+          install -m 600 /dev/null ~/.ssh/deploy_key
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<EOF
+          Host vm
+            HostName ${DEPLOY_HOST}
+            User ${DEPLOY_USER}
+            IdentityFile ~/.ssh/deploy_key
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            BatchMode yes
+          EOF
+          chmod 600 ~/.ssh/config
+
+      - name: Upload compose.yaml and secrets
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SMS_TOKEN: ${{ secrets.SMS_TOKEN }}
+        run: |
+          for v in DATABASE_URL SMS_TOKEN; do
+            if [ -z "${!v}" ] || [[ "${!v}" == *$'\n'* ]] || [[ "${!v}" == *"'"* ]]; then echo "::error::secret $v is empty, multiline or contains a single quote"; exit 1; fi
+          done
+          ssh vm "mkdir -p '$APP_DIR'"
+          scp -q deploy/compose.yaml "vm:$APP_DIR/compose.yaml.new"
+          # Секрети йдуть через stdin, а не аргументами: не потрапляють у ps і логи.
+          # Одинарні лапки: compose не інтерполює $ у значеннях .env.
+          printf "DATABASE_URL='%s'\nSMS_TOKEN='%s'\n" "$DATABASE_URL" "$SMS_TOKEN" \
+            | ssh vm "umask 077 && cat > '$APP_DIR/secrets.new'"
+
+      - name: Log in to GHCR on VM
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: printf '%s' "$GHCR_TOKEN" | ssh vm "docker login ghcr.io -u '$GITHUB_ACTOR' --password-stdin"
+
+      - name: Roll out (rolls back on failed healthcheck)
+        run: |
+          ssh vm bash -s -- "$APP_DIR" "$IMAGE" "${GITHUB_SHA::7}" "$GITHUB_ACTOR" <<'REMOTE'
+          set -euo pipefail
+          dir="$1"; image="$2"; sha="$3"; actor="$4"
+          cd "$dir"
+          umask 077                    # .env і *.prev містять секрети
+
+          # Новий .env: образ, sha і секрети з secrets.new (попередній крок). compose.yaml бере
+          # з нього ${DATABASE_URL:?…} і ${SMS_TOKEN:?…}.
+          { printf 'POSHTOMAT_IMAGE=%s\nPOSHTOMAT_SHA=%s\n' "$image" "$sha"; cat secrets.new; } > .env.new
+          rm -f secrets.new
+
+          # Новий compose.yaml має розібратися тим Compose, що стоїть на VM, — до будь-яких змін
+          # (27.10 Compose 2.2.3 не прочитав файл, docs/task-e-bonus.md). --quiet: без виводу секретів.
+          docker compose --env-file .env.new -f compose.yaml.new config --quiet
+
+          # Тягнемо образ до будь-яких змін на диску: якщо pull впаде, конфігурація лишиться стара.
+          docker pull "$image"
+
+          # Зберігаємо попередній стан для відкату, лише якщо деплой щось змінює (образ, секрети
+          # або compose.yaml): деплой без змін не затирає точку відкату.
+          # На першому деплої поточних файлів ще немає, тож і *.prev не з'являться.
+          # secrets.env попередньої схеми не чіпаємо: його читає compose.yaml.prev з тієї схеми.
+          changed=0
+          if ! { [ -f .env ] && cmp -s .env.new .env && cmp -s compose.yaml.new compose.yaml; }; then
+            changed=1
+            for f in compose.yaml .env; do
+              if [ -f "$f" ]; then cp -p "$f" "$f.prev"; fi
+            done
+          fi
+
+          mv compose.yaml.new compose.yaml
+          mv .env.new .env
+
+          # /health не звертається до пулу (14.10 відповідав 200 увесь інцидент), тож після --wait
+          # перевіряємо, що api справді отримав DB_POOL_MAX і пул видає з'єднання.
+          # Не більше: читання parcels (потрібна справжня сесія — ще один секрет) і насичення
+          # пулу під трафіком так не видно — це readiness-ендпоінт з docs/postmortem.md, дія #8.
+          pool_ok() {
+            local want got code
+            want="$(docker compose exec -T api printenv DB_POOL_MAX)" \
+              || { echo "::error::api: DB_POOL_MAX не задано, код візьме дефолт 4"; return 1; }
+            got="$(docker compose exec -T api node -e 'import("./src/config.js").then((m) => console.log(m.loadConfig().dbPoolMax))')" || return 1
+            if [ "$want" != "$got" ]; then echo "::error::api: DB_POOL_MAX=$want, а код бере $got"; return 1; fi
+            # сесія, якої немає: обробник бере з'єднання з пулу, шукає її і відповідає 403
+            code="$(curl -s -m 10 -o /dev/null -w '%{http_code}' -H "Authorization: Bearer probe-$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')" http://127.0.0.1:8080/admin/parcels)" || true
+            if [ "$code" != 403 ]; then echo "::error::проба пулу: $code замість 403"; return 1; fi
+          }
+
+          if docker compose up -d --remove-orphans --wait --wait-timeout 90 && pool_ok; then
+            echo "Deployed $image"
+            # Журнал для runbook чергового (формат як incident/deploys.log).
+            printf '%s   deploy    %s  %s  %s\n' "$(date -Iseconds)" "$sha" "$actor" "$image" >> "$dir/deploys.log"
+            exit 0
+          fi
+
+          docker compose logs --tail 50 api worker || true
+          if [ "$changed" = 0 ]; then
+            # Повторний деплой того самого релізу: *.prev — це реліз ДО нього, а не точка відкату
+            # для цього запуску. Збій тут не робить реліз поганим, тож нічого не відкочуємо.
+            echo "::error::перевірка не пройшла, але файли не змінилися — відкату немає, лишається $sha"
+            printf '%s   failed    %s  %s  %s  unchanged\n' "$(date -Iseconds)" "$sha" "$actor" "$image" >> "$dir/deploys.log"
+            exit 1
+          fi
+          echo "::error::new release is unhealthy, rolling back"
+          # Одразу, до спроби відкату: якщо відкат не підніметься, останнім лишиться цей рядок.
+          printf '%s   failed    %s  %s  %s\n' "$(date -Iseconds)" "$sha" "$actor" "$image" >> "$dir/deploys.log"
+          if [ -f .env.prev ]; then
+            # Копіюємо, а не переміщуємо: *.prev лишаються точкою відкату.
+            for f in compose.yaml .env; do
+              if [ -f "$f.prev" ]; then cp -p "$f.prev" "$f"; fi
+            done
+            docker compose up -d --remove-orphans --wait --wait-timeout 90
+            # Та сама перевірка, що й для релізу: без неї rollback у журналі означав би лише «/health 200».
+            pool_ok || { echo "::error::відкат піднявся, але перевірка пулу не пройшла"; exit 1; }
+            echo "Rolled back to $(grep '^POSHTOMAT_' .env | tr '\n' ' ')"   # без секретів з .env
+            # Друге поле — sha, на який відкотилися; у .env, записаному до цієї схеми,
+            # POSHTOMAT_SHA немає → unknown.
+            prev_sha="$(sed -n 's/^POSHTOMAT_SHA=//p' .env)"
+            printf '%s   rollback  %s  %s  failed %s\n' "$(date -Iseconds)" "${prev_sha:-unknown}" "$actor" "$sha" >> "$dir/deploys.log"
+          fi
+          exit 1
+          REMOTE
+
+      - name: Clean up
+        if: always()
+        run: |
+          ssh vm "docker logout ghcr.io; rm -f '$APP_DIR/compose.yaml.new' '$APP_DIR/secrets.new' '$APP_DIR/.env.new'" || true
+          rm -f ~/.ssh/deploy_key
