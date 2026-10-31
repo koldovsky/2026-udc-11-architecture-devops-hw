@@ -1,35 +1,72 @@
-# Поштомат громади — продакшн на одній VM (docker compose up -d).
-# PostgreSQL працює на самій VM, поза compose.
+# Poshtomat hromady: production on one VM. PostgreSQL runs on the VM itself, outside compose.
+#
+# The VM holds a git checkout of this repository. A release is one commit, so app/ and this
+# file always change together; the image is built on the VM from ../app and tagged with the
+# commit. pipeline/deploy.yml runs `docker compose -f deploy/compose.yaml up -d --build --wait`
+# there after approval.
+#
+# Values that are not in git come from deploy/.env on the VM, ignored by git, mode 600 and
+# owned by DEPLOY_USER, the user the pipeline deploys as (pipeline/deploy.yml):
+#   IMAGE_TAG=<commit of the running release>    written by the pipeline on every deploy
+#   SMS_TOKEN=<token of the SMS provider>        set once by the infrastructure developer
+# Without them compose refuses to start, and so does every other docker compose command on
+# this file (ps, logs, exec).
+
+x-app: &app
+  image: poshtomat:${IMAGE_TAG:?set IMAGE_TAG in deploy/.env to the commit of the release}
+  restart: unless-stopped
+  init: true
+  read_only: true
+  tmpfs:
+    - /tmp
+    # npm writes its cache and logs here; the nightly job is
+    # `docker compose run --rm worker npm run expire` (docs/ops/backup-runbook.md:18-19)
+    - /home/node/.npm
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 128
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+
+# What app/src/config.js reads, plus TZ for the runtime (local timestamps in the logs,
+# app/src/log.js:2). Rule E1 in tools/check-deploy.mjs compares this with config.js.
+x-env: &env
+  TZ: "Europe/Kyiv"
+  LOG_LEVEL: "info"
+  DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
+  DB_POOL_MAX: "20"
+  DB_POOL_WAIT_MS: "2000"
+  SMS_BASE_URL: "https://sms.example.net/api/v2"
+  SMS_TOKEN: ${SMS_TOKEN:?set SMS_TOKEN in deploy/.env}
+  SMS_RATE_PER_SEC: "20"
+  COURIER_BASE_URL: "https://courier.example.com/api/v1"
+
 services:
   api:
-    image: poshtomat:latest
+    <<: *app
     build:
       context: ../app
       dockerfile: ../deploy/Dockerfile
     ports:
       - "8080:8080"
     environment:
-      TZ: "Europe/Kyiv"
+      <<: *env
       PORT: "8080"
-      LOG_LEVEL: "info"
-      DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
-      DB_POOL_MAX: "20"
-      DB_POOL_WAIT_MS: "2000"
-      SMS_BASE_URL: "https://sms.example.net/api/v2"
-      SMS_TOKEN: "CHANGE_ME"
-      SMS_RATE_PER_SEC: "20"
-      COURIER_BASE_URL: "https://courier.example.com/api/v1"
+    mem_limit: 512m
+    cpus: 1.0
+    stop_grace_period: 15s
 
   worker:
-    image: poshtomat:latest
+    <<: *app # the image api builds
     command: ["node", "src/worker.js"]
     environment:
-      TZ: "Europe/Kyiv"
-      LOG_LEVEL: "info"
-      DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
-      DB_POOL_MAX: "20"
-      DB_POOL_WAIT_MS: "2000"
-      SMS_BASE_URL: "https://sms.example.net/api/v2"
-      SMS_TOKEN: "CHANGE_ME"
-      SMS_RATE_PER_SEC: "20"
-      COURIER_BASE_URL: "https://courier.example.com/api/v1"
+      <<: *env # no PORT: the worker does not listen
+    healthcheck:
+      disable: true # no HTTP server; the image's HEALTHCHECK calls /health of the API
+    mem_limit: 256m
+    cpus: 0.5
+    stop_grace_period: 15s

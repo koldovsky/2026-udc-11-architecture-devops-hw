@@ -370,6 +370,66 @@ export function imageProblem(image) {
 const isNoneTest = (t) => (Array.isArray(t) ? String(t[0]).toUpperCase() === "NONE" : typeof t === "string" && t.trim().toUpperCase() === "NONE");
 const healthcheckOff = (hc) => hc?.disable === true || isNoneTest(hc?.test);
 
+// Rule E1 compares the compose environment with the variables this file of the app reads.
+export const CONFIG_JS = "app/src/config.js";
+// Read by the runtime, not by config.js: TZ gives the logs their local time (app/src/log.js:2).
+export const RUNTIME_ENV = ["TZ"];
+// Variables config.js reads that a service does not need, per service: only the API
+// listens on a port (app/src/server.js:95).
+export const NOT_NEEDED = { worker: ["PORT"] };
+// Services that do not run this app (a proxy, a cache), each with its reason: E1 skips them,
+// so their own variables are neither demanded nor rejected. None today.
+export const NOT_APP = [];
+
+/** Environment variables a JavaScript source reads: env.NAME, env["NAME"], process.env.NAME. */
+export function envReads(text) {
+  const names = new Set();
+  for (const m of String(text).matchAll(/\benv(?:\.([A-Za-z_]\w*)|\[\s*(["'`])([A-Za-z_]\w*)\2\s*\])/g)) names.add(m[1] ?? m[3]);
+  return [...names];
+}
+
+/**
+ * Can this compose environment value reach the container empty? config.js treats an empty
+ * value like a missing one (`Number("") || 4`). Never empty: a non-blank literal, ${VAR:?…}
+ * (compose stops without VAR), ${VAR:-default} with a default that cannot be empty. Can be
+ * empty: "", ${VAR} and $VAR (blank when VAR is unset), ${VAR-…}, ${VAR?…}, ${VAR:+…},
+ * ${VAR+…}, a default that is only another reference (${A:-${B}}, ${A:-$B}), and a bare name
+ * (`- VAR`, `VAR:`), which passes on whatever the shell running compose has, or nothing.
+ * Nested references are resolved from the inside out.
+ */
+export function mayBeEmpty(value) {
+  if (value === null || value === undefined) return true;
+  // a ${…} whose body holds no other reference, or a bare $NAME: the innermost ones first
+  const reference = /\$\{([A-Za-z_]\w*)(?:(:\?)[^${}]*|:-([^${}]*)|:?[-?+][^${}]*)?\}|\$([A-Za-z_]\w*)/g;
+  let text = String(value).replaceAll("$$", "\u0001"); // $$ is a literal $, never a reference
+  for (let before = null; before !== text; ) {
+    before = text;
+    text = text.replace(reference, (whole, name, required, def) => (required ? "x" : (def ?? "")));
+  }
+  return text.trim() === "";
+}
+
+const fromTokens = (stage) => tokenize(stage.from.args).filter((t) => !t.startsWith("--"));
+const stageAlias = (stage) => {
+  const tokens = fromTokens(stage);
+  const i = tokens.findIndex((t) => t.toUpperCase() === "AS");
+  return i === -1 ? null : tokens[i + 1]?.toLowerCase();
+};
+
+/** Variables the final stage of the image sets with a non-empty ENV, its base stages (FROM <alias>) included. */
+function imageEnv(dockerfile) {
+  const all = stages(dockerfile);
+  const names = new Set();
+  for (let i = all.length - 1; i >= 0; ) {
+    for (const ins of all[i].body) {
+      if (ins.instruction === "ENV") for (const [key, value] of keyValues("ENV", ins.args)) if (value) names.add(key);
+    }
+    const base = fromTokens(all[i])[0]?.toLowerCase();
+    i = all.slice(0, i).findLastIndex((s) => stageAlias(s) === base);
+  }
+  return names;
+}
+
 // ---------------------------------------------------------------- rules
 
 // A one-shot job (e.g. a nightly script run by `docker compose run`): no ports and an explicit
@@ -621,6 +681,38 @@ export const RULES = [
         }
       }
       return problems.length ? fail(`не закріплено: ${problems.join("; ")}`) : pass(`закріплено: ${count}`);
+    },
+  },
+  {
+    id: "E1",
+    title: "Compose environment matches what app/src/config.js reads",
+    hint: "Every service sets each variable app/src/config.js reads, under the same name, and nothing config.js does not read: config.js has a fallback for every variable, so a missing or renamed one silently becomes a development default (the 2026-10-14 incident). Fix the name in compose, or change config.js and compose in the same commit. An empty value falls back the same way, so a value must not be able to come out empty: a literal, ${VAR:?…} or ${VAR:-literal}, not \"\", ${VAR}, ${VAR:-${OTHER}} or a bare name. A variable the image sets with ENV need not be in compose. A variable the runtime reads outside config.js goes into RUNTIME_ENV, a variable a service does not need into NOT_NEEDED, a service that does not run this app into NOT_APP, each with its reason. Variables from env_file: are invisible to this rule: list them under environment:.",
+    check({ root, dockerfile, compose }) {
+      const problem = composeProblem(compose);
+      if (problem) return problem;
+      const configPath = join(root, CONFIG_JS);
+      if (!existsSync(configPath)) return fail(`${CONFIG_JS} not found, nothing to compare compose with`);
+      const reads = envReads(readFileSync(configPath, "utf8"));
+      if (!reads.length) return fail(`${CONFIG_JS}: no env.NAME read found, nothing to compare compose with`);
+      const fromImage = imageEnv(dockerfile);
+      const checked = services(compose).filter(([name]) => !NOT_APP.includes(name));
+      if (!checked.length) return fail(`every service is in NOT_APP, nothing to compare ${CONFIG_JS} with`);
+      const problems = [];
+      for (const [name, svc] of checked) {
+        const entries = envEntries(svc?.environment);
+        const set = new Set(entries.map(([key]) => key));
+        const known = (key) => reads.includes(key) || RUNTIME_ENV.includes(key);
+        const unknown = [...set].filter((key) => !known(key));
+        const missing = reads.filter((key) => !set.has(key) && !fromImage.has(key) && !(NOT_NEEDED[name] ?? []).includes(key));
+        const empty = entries.filter(([key, value]) => known(key) && mayBeEmpty(value)).map(([key]) => key);
+        if (unknown.length) problems.push(`${name}: not read by ${CONFIG_JS}: ${unknown.join(", ")}`);
+        if (missing.length) problems.push(`${name}: missing: ${missing.join(", ")}`);
+        if (empty.length) problems.push(`${name}: may be empty: ${empty.join(", ")}`);
+      }
+      const names = checked.map(([name]) => name).join(", ");
+      return problems.length
+        ? fail(problems.join("; "))
+        : pass(`${names}: no unknown, missing or possibly empty variables (${CONFIG_JS} reads ${reads.length})`);
     },
   },
 ];

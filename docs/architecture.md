@@ -12,20 +12,19 @@
 ## Level 1 — System Context
 
 ```mermaid
+%%{init: {"wrap": true}}%%
 C4Context
   title Poshtomat hromady - System Context (as in code, v1.7.3)
-
-  Person(resident, "Resident", "Gets an SMS with a pickup code and collects the parcel")
-  Person(staff, "Community staff", "Views the parcel list")
+  UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="1")
 
   System_Ext(terminal, "Locker terminal", "Screen on the locker; its code is not in this repo")
   System_Ext(scanner, "Delivery operator scanner", "Registers a parcel when it goes into a cell; its code is not in this repo")
-  System_Ext(monitoring, "Monitoring", "Polls the health endpoint; named only in the docs")
-
-  System(poshtomat, "Poshtomat hromady", "Registers parcels, sends pickup codes by SMS, hands parcels out by code, returns uncollected parcels")
-
-  System_Ext(sms, "SMS provider", "HTTP API that sends SMS")
   System_Ext(courier, "Courier company returns API", "Collects uncollected parcels and takes them back to the sender")
+  Person(resident, "Resident", "Gets an SMS with a pickup code and collects the parcel")
+  System(poshtomat, "Poshtomat hromady", "Registers parcels, sends pickup codes by SMS, hands parcels out by code, returns uncollected parcels")
+  System_Ext(monitoring, "Monitoring", "Polls the health endpoint; named only in the docs")
+  System_Ext(sms, "SMS provider", "HTTP API that sends SMS")
+  Person(staff, "Community staff", "Views the parcel list")
 
   Rel(resident, terminal, "1. Types the pickup code")
   Rel(terminal, poshtomat, "2. Sends the code", "POST /pickup, JSON/HTTP, no auth")
@@ -35,6 +34,13 @@ C4Context
   Rel(poshtomat, sms, "8. Sends the arrival SMS", "POST /messages, JSON/HTTPS, Bearer token")
   Rel(sms, resident, "9. Delivers the SMS with locker number and 6-digit code", "SMS")
   Rel(poshtomat, courier, "11. Requests a return after 72 h", "POST /returns, JSON/HTTPS, no auth header")
+
+  UpdateRelStyle(resident, terminal, $offsetX="-40", $offsetY="0")
+  UpdateRelStyle(terminal, poshtomat, $offsetX="-40", $offsetY="20")
+  UpdateRelStyle(scanner, poshtomat, $offsetX="-40", $offsetY="-40")
+  UpdateRelStyle(monitoring, poshtomat, $offsetX="-40", $offsetY="10")
+  UpdateRelStyle(poshtomat, sms, $offsetX="-120", $offsetY="-10")
+  UpdateRelStyle(sms, resident, $offsetX="-240", $offsetY="20")
 ```
 
 Arrows 6, 7 and 10 are inside the system and appear only on Level 2.
@@ -42,24 +48,25 @@ Arrows 6, 7 and 10 are inside the system and appear only on Level 2.
 ## Level 2 — Container
 
 ```mermaid
+%%{init: {"wrap": true, "c4": {"width": 270}}}%%
 C4Container
   title Poshtomat hromady - Container (as in code, v1.7.3)
+  UpdateLayoutConfig($c4ShapeInRow="3", $c4BoundaryInRow="1")
 
+  System_Ext(monitoring, "Monitoring", "Named only in the docs")
   Person(resident, "Resident")
   Person(staff, "Community staff")
-  System_Ext(terminal, "Locker terminal", "Not in this repo")
+  System_Ext(sms, "SMS provider", "HTTP API")
   System_Ext(scanner, "Delivery operator scanner", "Not in this repo")
-  System_Ext(monitoring, "Monitoring", "Named only in the docs")
+  System_Ext(terminal, "Locker terminal", "Not in this repo")
+  System_Ext(courier, "Courier company returns API", "HTTP API")
 
   System_Boundary(system, "Poshtomat hromady") {
-    Container(api, "API", "Node.js 22+, node:http, compose service api, port 8080", "Registers parcels, checks pickup codes, staff parcel list, health")
-    Container(worker, "SMS worker", "Node.js 22+, compose service worker, same image", "Reads batches of 50, waits 10 s after a round with fewer than 50 sent; SMS paced to 20/s in production, retry on 429")
     Container(job, "Nightly expiry job", "Node.js 22+ script, one-off container started by VM cron at 03:15", "Returns parcels waiting 72 h or more")
+    Container(worker, "SMS worker", "Node.js 22+, compose service worker, same image", "Reads batches of 50, waits 10 s after a round with fewer than 50 sent; SMS paced to 20/s in production, retry on 429")
+    Container(api, "API", "Node.js 22+, node:http, compose service api, port 8080", "Registers parcels, checks pickup codes, staff parcel list, health")
     ContainerDb(db, "Parcel database", "PostgreSQL on the VM in production; in-memory store in this repo", "Parcels, events, staff sessions")
   }
-
-  System_Ext(sms, "SMS provider", "HTTP API")
-  System_Ext(courier, "Courier company returns API", "HTTP API")
 
   Rel(resident, terminal, "1. Types the pickup code")
   Rel(terminal, api, "2. Sends the code", "POST /pickup, JSON/HTTP, no auth")
@@ -72,6 +79,14 @@ C4Container
   Rel(sms, resident, "9. Delivers the SMS with locker number and 6-digit code", "SMS")
   Rel(job, db, "10. Finds parcels waiting 72 h or more, sets status returned", "connection pool")
   Rel(job, courier, "11. Requests a return", "POST /returns, JSON/HTTPS, no auth header")
+
+  UpdateRelStyle(terminal, api, $offsetX="-200", $offsetY="-40")
+  UpdateRelStyle(scanner, api, $offsetX="-20", $offsetY="0")
+  UpdateRelStyle(monitoring, api, $offsetX="-60", $offsetY="0")
+  UpdateRelStyle(worker, db, $offsetX="0", $offsetY="-40")
+  UpdateRelStyle(worker, sms, $offsetX="-20", $offsetY="20")
+  UpdateRelStyle(sms, resident, $offsetX="0", $offsetY="-10")
+  UpdateRelStyle(job, db, $offsetX="-140", $offsetY="0")
 ```
 
 Notes on what the diagram shows:
