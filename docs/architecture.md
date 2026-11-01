@@ -2,12 +2,12 @@
 
 > Task B. The diagrams show the system as it is in `app/` (version 1.7.3,
 > `app/package.json:3`), not as `app/docs/ARCHITECTURE.md` describes it. Runtime values
-> (the URL schemes on arrows 8 and 11, the SMS rate) come from `deploy/compose.yaml`,
-> which overrides the code defaults. The database is the production PostgreSQL named in
-> `app/src/db.js:1-2`; this repo has only an in-memory store (see the notes under
-> Level 2). Every arrow carries a number; the same number is a row in "Arrows and
-> evidence". Line numbers refer to the commit this branch starts from (`c6800ab`). `app/`
-> is not modified.
+> (the URL schemes on arrows 8 and 11, the SMS rate of 20/s) come from the production compose
+> file at `c6800ab`, which overrides the code defaults; Task D later sets the rate to 5/s.
+> `c6800ab:deploy/compose.yaml:34` is line 34 of `git show c6800ab:deploy/compose.yaml`. The
+> database is the production PostgreSQL named in `app/src/db.js:1-2`; this repo has only an
+> in-memory store (see the notes under Level 2). Every arrow carries a number; the same
+> number is a row in "Arrows and evidence". `app/` is not modified.
 
 ## Level 1 — System Context
 
@@ -92,7 +92,7 @@ C4Container
 Notes on what the diagram shows:
 
 - **Database.** Production runs the same interface on PostgreSQL (`app/src/db.js:1-2`,
-  `app/README.md:23-24`), on the VM outside compose (`deploy/compose.yaml:2`). This repo
+  `app/README.md:23-24`), on the VM outside compose (`c6800ab:deploy/compose.yaml:2`). This repo
   contains only the in-memory store (`app/src/db.js:11-59`). Each process builds its own
   pool with a fresh store (`app/src/db.js:63`; called from `app/src/server.js:91`,
   `app/src/worker.js:43`, `app/bin/expire-parcels.js:24`), and `DATABASE_URL` is read
@@ -105,13 +105,13 @@ Notes on what the diagram shows:
   names them only in comments (`app/src/parcels.js:34`, `app/src/parcels.js:58`), and
   `find app -type f` lists no client code.
 - **Deployment.** The boundary on Level 2 is the software system. All its containers and
-  the database run on one VM (`deploy/compose.yaml:1-2`, `docs/ops/backup-runbook.md:7`).
+  the database run on one VM (`c6800ab:deploy/compose.yaml:1-2`, `docs/ops/backup-runbook.md:7`).
 - **Protocols.** The API is plain HTTP (`app/src/server.js:1`, `app/src/server.js:93`);
   TLS is not in the code. The SMS and courier clients take the scheme from the base URL
   (`app/src/sms.js:31`, `app/src/courier.js:7`). The code defaults are `http://localhost`
   (`app/src/config.js:11`, `app/src/config.js:14`); the production compose file sets
-  `https` URLs for both services (`deploy/compose.yaml:18`, `deploy/compose.yaml:21`,
-  `deploy/compose.yaml:32`, `deploy/compose.yaml:35`). Arrows 8 and 11 are therefore
+  `https` URLs for both services (`c6800ab:deploy/compose.yaml:18`, `c6800ab:deploy/compose.yaml:21`,
+  `c6800ab:deploy/compose.yaml:32`, `c6800ab:deploy/compose.yaml:35`). Arrows 8 and 11 are therefore
   HTTPS, in line with the production shape shown for the database. The worker's
   settings apply to the nightly job too, since it runs as `docker compose run --rm worker`.
 
@@ -131,10 +131,10 @@ drew it on only one); **missed** — the arrow is not in its diagrams.
 | 5 | Monitoring → API: `GET /health`, returns status and version | L1, L2 | `app/src/server.js:37`; the caller is named only in `app/docs/ARCHITECTURE.md:17` | yes | yes |
 | 6 | API → Database: inserts parcels, finds a waiting parcel by code, sets `picked_up`, writes a `picked_up` event, lists parcels, looks up staff sessions | L2 | `app/src/parcels.js:43-44`, `app/src/parcels.js:61`, `app/src/parcels.js:64-67`, `app/src/parcels.js:74`, `app/src/server.js:18` | yes | yes |
 | 7 | SMS worker → Database: reads up to 50 waiting parcels without `notifiedAt`, sets `notifiedAt` after each sent SMS | L2 | `app/src/worker.js:9`, `app/src/worker.js:24`, `app/src/worker.js:33`, `app/src/db.js:40-45` | yes | yes |
-| 8 | SMS worker → SMS provider: `POST {SMS_BASE_URL}/messages` with `{to, text}`, `Bearer SMS_TOKEN`, JSON over HTTPS in production, paced to `SMS_RATE_PER_SEC` (20/s in production, 5/s code default), up to 4 attempts on HTTP 429 | L1, L2 | `app/src/worker.js:28`, `app/src/worker.js:44-49`, `app/src/config.js:13`, `app/src/sms.js:14`, `app/src/sms.js:21-25`, `app/src/sms.js:31-41`, `deploy/compose.yaml:32`, `deploy/compose.yaml:34` | yes | yes |
+| 8 | SMS worker → SMS provider: `POST {SMS_BASE_URL}/messages` with `{to, text}`, `Bearer SMS_TOKEN`, JSON over HTTPS in production, paced to `SMS_RATE_PER_SEC` (20/s in production at `c6800ab`, 5/s after Task D, 5/s code default), up to 4 attempts on HTTP 429 | L1, L2 | `app/src/worker.js:28`, `app/src/worker.js:44-49`, `app/src/config.js:13`, `app/src/sms.js:14`, `app/src/sms.js:21-25`, `app/src/sms.js:31-41`, `c6800ab:deploy/compose.yaml:32`, `c6800ab:deploy/compose.yaml:34` | yes | yes |
 | 9 | SMS provider → Resident: SMS with the locker number and the 6-digit code, sent to `recipientPhone` (delivery itself happens outside the code) | L1, L2 | `app/src/worker.js:11-13`, `app/src/worker.js:28`, `app/src/parcels.js:27` | yes | yes (L1 only) |
 | 10 | Nightly expiry job → Database: finds `waiting` parcels that arrived 72 h or more ago, sets status `returned` | L2 | `app/bin/expire-parcels.js:12-14`, `app/src/parcels.js:18`, `app/src/parcels.js:78-87` | yes | yes |
-| 11 | Nightly expiry job → Courier company returns API: `POST {COURIER_BASE_URL}/returns` with `parcel_id`, `locker_id`, `sender`, `reason`, JSON over HTTPS in production; the request carries only a `content-type` header, no authentication header | L1, L2 | `app/bin/expire-parcels.js:15`, `app/bin/expire-parcels.js:26`, `app/src/courier.js:6-18`, `deploy/compose.yaml:35` | **missed** — the docs say only that the job marks parcels as returned (`app/docs/ARCHITECTURE.md:22-23`) | yes |
+| 11 | Nightly expiry job → Courier company returns API: `POST {COURIER_BASE_URL}/returns` with `parcel_id`, `locker_id`, `sender`, `reason`, JSON over HTTPS in production; the request carries only a `content-type` header, no authentication header | L1, L2 | `app/bin/expire-parcels.js:15`, `app/bin/expire-parcels.js:26`, `app/src/courier.js:6-18`, `c6800ab:deploy/compose.yaml:35` | **missed** — the docs say only that the job marks parcels as returned (`app/docs/ARCHITECTURE.md:22-23`) | yes |
 
 ## What the AI invented / missed
 
@@ -167,18 +167,18 @@ Wrong details on drawn elements (not arrows, not in the count):
   the docs, and, like the docs, gives a fixed period: after a full batch of 50 the worker
   goes again without waiting (`app/src/worker.js:65-66`).
 - From code: the worker is limited to "5 SMS/s". That is the code default
-  (`app/src/config.js:13`); production sets 20 (`deploy/compose.yaml:34`), which the run
+  (`app/src/config.js:13`); production sets 20 (`c6800ab:deploy/compose.yaml:34`), which the run
   did not see.
 
 Not counted — details the run neither listed as assumptions nor gave a source for:
 
 - From code: `HTTPS` on the SMS and courier arrows (`ai-runs/c4-from-code.md:34-35`,
-  `ai-runs/c4-from-code.md:73-74`). It matches production (`deploy/compose.yaml:32`,
-  `deploy/compose.yaml:35`), which the run did not see. The `app/src` defaults are
+  `ai-runs/c4-from-code.md:73-74`). It matches production (`c6800ab:deploy/compose.yaml:32`,
+  `c6800ab:deploy/compose.yaml:35`), which the run did not see. The `app/src` defaults are
   `http://localhost` (`app/src/config.js:11`, `app/src/config.js:14`); the only `https`
-  URLs in the run's input are test fixtures (`app/test/config.test.js:19`,
-  `app/test/config.test.js:21`, `app/test/sms.test.js:26`). The run cites no source, so
-  whether it took the scheme from them is unknown.
+  URLs in the run's input are in its tests: `grep -rn 'https://' app` lists
+  `app/test/config.test.js:19`, `:21`, `:26`, `:28` and `app/test/sms.test.js:26`, `:38`, `:51`.
+  The run cites no source, so whether it took the scheme from them is unknown.
 
 Neither run pointed out:
 

@@ -1,5 +1,5 @@
 # Deploy pipeline: tests and deploy checks → image build and smoke run → deploy to the VM
-# after manual approval.
+# after manual approval. Pull requests to main run the tests and the build only.
 #
 # It lives in pipeline/ so that it never runs in the course repository; the team's
 # repository keeps it under .github/workflows/.
@@ -12,11 +12,15 @@
 #     absolute path of letters, digits and . _ / - only. That checkout must be able to
 #     `git fetch origin`.
 # SMS_TOKEN stays in deploy/.env on the VM (deploy/compose.yaml) and never passes through CI;
-# that file must be readable by DEPLOY_USER, or the deploy stops before it touches the file.
+# that file must be readable by DEPLOY_USER, or the deploy stops before it changes the checkout.
 name: deploy
 
 on:
   push:
+    branches: [main]
+  # pull_request, not pull_request_target: code from a pull request runs without secrets and
+  # with the read-only token of `permissions:` below
+  pull_request:
     branches: [main]
   workflow_dispatch:
 
@@ -26,8 +30,8 @@ permissions:
 # One run per branch at a time, so runs of main deploy in push order and an older commit never
 # replaces a newer one on the VM. While a deploy waits for approval, the next run of main waits
 # too; a newer one replaces it in the queue (it contains the same commits). The group is per
-# branch: a workflow_dispatch on another branch (tests only, see the deploy job's if:) cannot
-# cancel a queued run of main.
+# ref: a pull request or a workflow_dispatch on another branch (tests and build only, see the
+# deploy job's if:) cannot cancel a queued run of main.
 concurrency:
   group: deploy-${{ github.ref }}
   cancel-in-progress: false
@@ -95,8 +99,8 @@ jobs:
           DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
         # The script below runs on the VM: $1 is the checkout, $2 the commit. --wait waits for the
         # API's HEALTHCHECK, which calls /health: a liveness check that does not touch the
-        # database. A failed deploy leaves the checkout on the new commit and is rolled back by
-        # hand (docs/runbook.md, "Rollback"). A readiness check and an automatic rollback are
+        # database. A deploy that fails after the switch leaves the checkout on the new commit and
+        # is rolled back by hand (docs/runbook.md, "Rollback"). A readiness check and an automatic rollback are
         # post-mortem action items 5, 6 and 11 (docs/postmortem.md).
         run: |
           # ssh hands its arguments to the VM's shell as one string, so quotes do not survive:
@@ -114,14 +118,15 @@ jobs:
             git status --short >&2
             exit 1
           fi
-          git fetch --tags origin
-          git switch --detach "$2"
           # deploy/.env keeps SMS_TOKEN; IMAGE_TAG names the commit the image is built from.
-          # A file this user cannot read would be replaced below without its SMS_TOKEN: stop instead.
+          # A file this user cannot read would be replaced below without its SMS_TOKEN: stop
+          # instead, before the switch, so the checkout stays on the commit it was on.
           if [ ! -r deploy/.env ]; then
             echo "deploy/.env in $1 is missing or not readable by $(id -un); it must hold SMS_TOKEN" >&2
             exit 1
           fi
+          git fetch --tags origin
+          git switch --detach "$2"
           # The new file is private from the moment it exists: umask 077, in a subshell so that it
           # applies to this file alone. rm first: umask does not change a file left by a failed run.
           # grep exits 1 when IMAGE_TAG is the only line; any other failure stops the deploy.

@@ -7,9 +7,13 @@
 > to each release; its path is the `DEPLOY_PATH` variable of the `production` environment
 > in the repository settings, and step 2 of "First 5 minutes" shows how to find it on the
 > VM. Compose takes `IMAGE_TAG` and `SMS_TOKEN` from `deploy/.env` there
-> (`deploy/compose.yaml:8-13`): without that file every `docker compose` command below
-> stops with an error that names the missing variable. Then escalate to the infrastructure
-> developer, and do not print the file: it holds the SMS token.
+> (`deploy/compose.yaml:8-13`). That file has mode 600 and belongs to the deploy user, the
+> `DEPLOY_USER` of the pipeline, who may run docker (`pipeline/deploy.yml:9-10`). Step 2 of
+> "First 5 minutes" switches to that user with `sudo`, as the backup runbook uses `sudo` on
+> the same VM (`docs/ops/backup-runbook.md:25`), and every command after it runs as that
+> user. Without the file, or as another user, every `docker compose` command below stops
+> with an error that names the missing variable or the file. Then escalate to the
+> infrastructure developer, and do not print the file: it holds the SMS token.
 
 - **Alerts:** `ApiLatencyP95High` — `p95_ms > 2000` for 3 minutes (page);
   `Api5xxRateHigh` — `error_rate > 0.05` for 3 minutes (page). They usually fire
@@ -26,18 +30,21 @@
 `SmsProvider429RateHigh` condition was met at 13:36, the same minute as on the incident
 day, and `heap usage high` warnings appeared in the API log on both days from the start of
 the available logs (12:00) (`docs/rca.md`, evidence 16 and "What in the data is NOT the
-cause"). The API does not call the SMS provider. Look at them only if the steps below
-point there.
+cause"). The worker then sent at 20/s, twice the provider's limit; since Task D it sends at
+5/s (post-mortem action items 10 and 12 follow up on the warning). The API does not call
+the SMS provider. Look at them only if the steps below point there.
 
 ## First 5 minutes
 
 1. Acknowledge the page in `#poshtomat-oncall`.
-2. Find the deployment directory, then check which version runs and how long the
-   containers have been up:
+2. Find the deployment directory, switch to the deploy user, then check which version runs
+   and how long the containers have been up:
 
    ```bash
    ssh poshtomat-prod-1
-   docker compose ls                             # CONFIG FILES: <dir>/deploy/compose.yaml of the running project
+   sudo docker compose ls                        # CONFIG FILES: <dir>/deploy/compose.yaml of the running project
+   sudo stat -c '%U %a' <dir>/deploy/.env        # "<deploy user> 600": the owner is the deploy user
+   sudo -iu <deploy user>                        # every command from here on runs as this user
    cd <dir>                                      # the directory that holds deploy/
    git log -1 --format='%h %ci %s'               # the deployed commit and its time
    curl -s http://localhost:8080/health          # {"status":"ok","version":"<version>"}
@@ -65,10 +72,21 @@ point there.
    ```bash
    git fetch origin && git log origin/main --since='2 hours ago' --format='%ci %s' -- app deploy
    ```
-3. **A deploy or a configuration change in the last 60 minutes, and the page started
+3. **Save the API log before you change anything.** A rollback or a configuration fix
+   recreates the `api` container, and Docker deletes a container's log together with it;
+   the count of failed pickups after the incident ("When to escalate") needs this file:
+
+   ```bash
+   docker compose -f deploy/compose.yaml logs --no-log-prefix api > ~/api-$(date +%Y%m%dT%H%M).jsonl
+   ls -l ~/api-*.jsonl                           # the file exists and is not empty
+   ```
+
+   The API log has no request bodies, phone numbers, codes or tokens: it records method,
+   path, status, time and the error message (`app/src/server.js:73-75`).
+4. **A deploy or a configuration change in the last 60 minutes, and the page started
    after it → roll back first** (see "Rollback" under "What to do"), then continue the diagnosis. Do not
    wait for the cause.
-4. Check whether the API can get a database connection, without side effects (a made-up
+5. Check whether the API can get a database connection, without side effects (a made-up
    staff token takes one pool connection for a read-only session lookup and changes
    nothing):
 
@@ -110,8 +128,8 @@ same `db pool wait timeout`, so the log alone does not tell them apart.
 
 | Situation | Action | Command | Risk / what to check after |
 |---|---|---|---|
-| A deploy in the last 60 minutes, cause unknown | Roll back to the previous release — `app/` **and** `deploy/compose.yaml` together — and rebuild the image | See "Rollback" below | A rollback of the image alone keeps a broken compose file. After it, check the version (`curl -s http://localhost:8080/health`), `dbPoolMax` (Diagnosis 3) and "How to make sure all is well" |
-| `dbPoolMax` is not 20 because `DB_POOL_MAX` is missing or misnamed in compose | Put `DB_POOL_MAX: "20"` back into the shared `x-env:` block of `deploy/compose.yaml` (both `api` and `worker` take their variables from it), then recreate the containers | `docker compose -f deploy/compose.yaml up -d api worker` | Compose recreates only containers whose configuration changed; check Diagnosis 3 again. The edit leaves local changes in the VM checkout, and the pipeline does not deploy over them: merge the same fix to `main` and tell the release author. Rule E1 of the deploy checks fails on such a compose before a deploy, so this row matters only when the checks were bypassed |
+| A deploy in the last 60 minutes, cause unknown | Roll back to the previous release — `app/` **and** `deploy/compose.yaml` together — and rebuild the image | See "Rollback" below | Save the API log first (step 3 of "First 5 minutes"): the rollback recreates the containers, and Docker deletes their logs with them. A rollback of the image alone keeps a broken compose file. After it, check the version (`curl -s http://localhost:8080/health`), `dbPoolMax` (Diagnosis 3) and "How to make sure all is well" |
+| `dbPoolMax` is not 20 because `DB_POOL_MAX` is missing or misnamed in compose | Put `DB_POOL_MAX: "20"` back into the shared `x-env:` block of `deploy/compose.yaml` (`api` takes it directly, `worker` through `x-worker-env:`), then recreate the containers | `docker compose -f deploy/compose.yaml up -d api worker` | Save the API log first (step 3 of "First 5 minutes"): compose recreates the containers whose configuration changed, and Docker deletes their logs with them. Check Diagnosis 3 again. The edit leaves local changes in the VM checkout, and the pipeline does not deploy over them: merge the same fix to `main` and tell the release author. Rule E1 of the deploy checks fails on such a compose before a deploy, so this row matters only when the checks were bypassed |
 | `pg_isready` fails or the database is slow | Escalate (see below) | — | Restarting the API does not help a slow database |
 | `db_pool_in_use` pinned at 20 with a queue, `pg_isready` answers, `rps` about the same as yesterday, outside the backup window 02:00–02:30 | The API process may be holding its connections (a hung query, a code path that does not give the connection back); slow queries look the same in these metrics. Escalate to the infrastructure developer, and meanwhile restart the API once | `docker compose -f deploy/compose.yaml restart api` | A restart drops the requests in flight. If `db_pool_waiting` is above 0 again within 10 minutes, a restart does not hold: do not restart again, wait for the escalation |
 | Nothing above matches | Escalate with what you found | — | — |
@@ -135,7 +153,9 @@ release, without waiting for the pipeline and its approval.
 A release is a commit, not a tag (`deploy/compose.yaml:3`): the pipeline neither tags it nor
 writes the deploy history. The checkout remembers every switch in its reflog, so the release
 that ran before is the one the latest switch moved from. The first two commands check the
-checkout, the third finds that release.
+checkout, the third finds that release. Run them as the deploy user (step 2 of "First 5
+minutes"), after the API log is saved (step 3): the `sed` line rewrites `deploy/.env`,
+which only that user can write.
 
 ```bash
 git rev-parse --is-inside-work-tree                 # "true" = a git checkout
@@ -154,9 +174,16 @@ from `git status --short`, or a top line that is not `checkout: moving from …`
 call the release author or the infrastructure developer. Without the `sed` line the
 previous release's code would be built under the tag of the broken commit. A release from
 before the pipeline (v1.8.0 and older) has its own compose file with the fixed image
-`poshtomat:latest` and no `IMAGE_TAG`; there the `sed` line changes nothing compose reads,
-and the rollback works the same. To return to the current code later: merge the fix to
-`main`, and the pipeline deploys it after approval.
+`poshtomat:latest` and no `IMAGE_TAG`; there the `sed` line changes nothing compose reads.
+In git, that compose file also sets the placeholder `SMS_TOKEN: "CHANGE_ME"` for both
+services (`git show c6800ab:deploy/compose.yaml | grep -n SMS_TOKEN` → lines 19 and 33), and
+`deploy/.env` does not replace it: compose uses that file only for `${…}` references. The
+API recovers, but the worker may be left without a working token, and how the real token
+reached production before the pipeline is not in this repository. After such a rollback,
+once new parcels have arrived, count the failed sends:
+`docker compose -f deploy/compose.yaml logs --since 10m worker | grep -c -e 'sms send failed' -e 'sms delivery failed'`.
+Anything other than `0`: call the infrastructure developer. To return to the current code
+later: merge the fix to `main`, and the pipeline deploys it after approval.
 
 ## When to escalate and whom to call
 
@@ -171,13 +198,16 @@ and the rollback works the same. To return to the current code later: merge the 
 - After recovery, if `POST /pickup` answered 503 during the incident → service developer
   and the project coordinator, who handles the hotline: some parcels may be marked as
   picked up while the door did not open, and fast failures can be among them too
-  (`docs/rca.md`, "Side effect to check"; post-mortem action item 8). Count them with
-  `docker compose -f deploy/compose.yaml logs --since 2h --no-log-prefix api | grep -c '"path":"/pickup","status":503'`,
-  with `--since` covering the whole incident.
+  (`docs/rca.md`, "Side effect to check"; post-mortem action item 8). Count them in the log
+  saved in step 3 of "First 5 minutes":
+  `grep -c '"path":"/pickup","status":503' ~/api-<time>.jsonl`. After a rollback or a
+  configuration fix, `docker compose logs` shows only the new containers, so it cannot give
+  this count; if the log was not saved, say so, and the database query of action item 8
+  gives the parcels instead.
 
 ## How to make sure all is well
 
-- The probe from step 4 of the first 5 minutes returns `403` in well under a second.
+- The probe from step 5 of the first 5 minutes returns `403` in well under a second.
 - No new pool timeouts: `docker compose -f deploy/compose.yaml logs --since 5m api | grep -c 'db pool wait timeout'` → `0`.
 - For 10 minutes: `db_pool_waiting` is 0, `db_pool_in_use` moves up and down instead of
   staying flat, p95 is below 300 ms, `error_rate` below 0.01. On 2026-10-13, a normal day,

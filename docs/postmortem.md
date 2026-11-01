@@ -49,7 +49,9 @@
 - On 13.10, the only normal day in the data, the condition of the SMS 429 warning was met
   at the same minute, and API heap warnings appeared from the start of the logs on both
   days. During the incident both looked like suspects, and there was no quick way to
-  compare with a normal day, so the investigation started with them.
+  compare with a normal day, so the investigation started with them. The 429s themselves
+  most likely come from the configuration: the worker sent at 20/s against the provider's
+  limit of 10/s, and a `429` is a message not sent (`docs/rca.md`, "Contributing factors").
 - There was no rule to suspect the most recent deploy first. What the on-call engineer saw
   at 14:12 was the API heap at 81 % with `heap usage high` in the log, which points to a
   memory leak, and a restart is the usual first response to a leak; nothing showed the
@@ -84,7 +86,7 @@
 | # | Action | Type | Owner (role) | How we verify it is done |
 |---|---|---|---|---|
 | 1 | In production, the service refuses to start when a setting it requires (for the API: `DATABASE_URL`, `DB_POOL_MAX`, `DB_POOL_WAIT_MS`) is missing or not a valid number, and names the variable; development defaults apply only outside production. Production is recognised by `NODE_ENV=production`, which the image already sets (`deploy/Dockerfile:9`) | prevent | service developer | a test calls `loadConfig` with `NODE_ENV=production` and no `DB_POOL_MAX` and expects an error naming it; a container started without the variable exits with a non-zero code |
-| 2 | A deterministic deploy check that compares `deploy/compose.yaml` with `app/src/config.js` in both directions: every environment variable of a service is read by `config.js` or is on a short allowlist of variables the runtime uses outside `config.js` (today only `TZ`), and every variable `config.js` reads is set for `api` and `worker`, apart from variables the image itself sets with `ENV` in `deploy/Dockerfile` (`NODE_ENV`, once action item 1 makes `config.js` read it) and an explicit per-service exemption list (today only `PORT` for `worker`) | prevent | infrastructure developer (owner of `deploy/` and `tools/check-deploy.mjs`) | the rule fails on the v1.8.0 compose (`DB_POOL_SIZE` is unknown, `DB_POOL_MAX` is missing) and on a compose without `SMS_RATE_PER_SEC`, passes on the current `deploy/compose.yaml`, which sets `TZ` and has no `PORT` for `worker`, and runs in CI before every deploy (Task D) |
+| 2 | A deterministic deploy check that compares `deploy/compose.yaml` with `app/src/config.js` in both directions: every environment variable of a service is read by `config.js` or is on a short allowlist of variables the runtime uses outside `config.js` (today only `TZ`), and every variable `config.js` reads is set for `api` and `worker`, apart from variables the image itself sets with `ENV` in `deploy/Dockerfile` (`NODE_ENV`, once action item 1 makes `config.js` read it) and an explicit per-service exemption list (today `PORT` for `worker`, and for `api` the SMS and courier variables only the worker uses) | prevent | infrastructure developer (owner of `deploy/` and `tools/check-deploy.mjs`) | the rule fails on the v1.8.0 compose (`DB_POOL_SIZE` is unknown, `DB_POOL_MAX` is missing) and on a compose without `SMS_RATE_PER_SEC`, passes on the current `deploy/compose.yaml`, which sets `TZ`, has no `PORT` for `worker` and no SMS or courier variables for `api`, and runs in CI before every deploy (Task D) |
 | 3 | The startup log line includes the effective configuration without secrets: pool size, pool wait, external hosts | detect | service developer | a test asserts that `service started` contains `db_pool_max` and `db_pool_wait_ms` and does not contain the SMS token |
 | 4 | Page when `db_pool_waiting > 0` for 2 minutes in a row | detect | infrastructure developer | replaying the metrics: on 14.10 the condition holds at 14:03, so the alert fires at 14:04, two minutes before `ApiLatencyP95High`; on 13.10 never (`for f in incident/metrics/2026-10-14.csv incident/baseline/metrics-2026-10-13.csv; do awk -F, 'NR>1 && $6>0 {run++; if (run==2 && !f) f=substr($1,12,5)} NR>1 && $6==0 {run=0} END {print FILENAME, (f ? f : "never")}' "$f"; done`) |
 | 5 | A readiness endpoint that takes a pool connection within a short timeout; monitoring and the post-deploy check use it, `/health` stays a liveness check | detect | service developer | a test with an exhausted pool: readiness answers 503 while `/health` answers 200 |
@@ -92,8 +94,9 @@
 | 7 | The runbook for API latency and 5xx pages starts with "deploy in the last 60 minutes → roll back first, investigate after"; every deploy and rollback is posted to `#poshtomat-oncall` automatically | mitigate | infrastructure developer | `docs/runbook.md` contains the step; the next deploy appears in the channel; a staging drill reaches the rollback within 10 minutes of the page |
 | 8 | Find the pickups left half-done on 14.10: parcels with status `picked_up` and `pickedUpAt` between 14:02 and 14:47 Europe/Kyiv (11:02–11:47 UTC: the code writes `pickedUpAt` with `toISOString()`, `app/src/parcels.js:63`) without a `picked_up` event; contact those residents and fix the records | mitigate | service developer with the project coordinator | the query result is attached to the incident ticket and every row is resolved. The 135 pickups that failed after more than 4.3 s (`docs/rca.md` evidence 14) are neither an upper nor a lower bound for the number of rows, so the query, not this number, gives the count |
 | 9 | Pickup uses one connection and one transaction for find, status change and event | prevent | service developer | a test where the event write fails leaves the parcel `waiting` and the code still valid |
-| 10 | Replace `SmsProvider429RateHigh` with a signal that does not fire on a normal weekday, for example the age of the oldest unsent SMS | detect | infrastructure developer | on staging, SMS held back longer than the threshold fire the new alert, and in the first two weeks in production it does not fire on a day without SMS delays (the incident data has no such metric, so 13.10 cannot be replayed) |
+| 10 | Once action item 12 is deployed, check whether `SmsProvider429RateHigh` still fires on a normal weekday; if it does, replace it with a signal that does not, for example the age of the oldest unsent SMS | detect | infrastructure developer | two weeks after action item 12: the alert has not fired on a day without SMS delays, or the new alert is in place and fires on staging when SMS are held back longer than the threshold (the incident data has no such metric, so 13.10 cannot be replayed) |
 | 11 | Write down and script the rollback: the previous release's `app/` and `deploy/compose.yaml` go back together, the image is rebuilt and the containers recreated; the script then prints the running version and `dbPoolMax` | mitigate | infrastructure developer | a staging drill: rolling back from a release with a renamed variable shows the previous version and `dbPoolMax 20` within 5 minutes; `docs/runbook.md` links the script |
+| 12 | Pace the worker at `SMS_RATE_PER_SEC=5`, half the provider's limit of 10 messages/s (`materials/vendors/sms-provider.md:16-17`), instead of 20/s (`git show c6800ab:deploy/compose.yaml \| grep -n SMS_RATE_PER_SEC` → lines 20 and 34, `"20"`) | prevent | infrastructure developer | `grep -n SMS_RATE_PER_SEC deploy/compose.yaml` shows one line, `"5"`, in the worker's `x-worker-env` block (done in Task D); after the deploy, `sms_429_per_min` stays below 20 through the weekday afternoon peaks of two weeks |
 
 Owner roles follow `materials/team.md`: two developers, one of whom also runs the
 infrastructure on the VM (the infrastructure developer), and the project coordinator, who
@@ -105,6 +108,8 @@ handles requests from residents and the hotline.
 
 ## Action item → check rule (Task D)
 
+- **First AI draft:** it failed 0 of the 13 rules that existed then
+  (`ai-runs/check-deploy-v1.txt`: `PASS 13  FAIL 0  SKIP 0`); rule E1 came after it.
 - **Action item:** #2
 - **Rule:** `E1` in `tools/check-deploy.mjs`, "Compose environment matches what
   app/src/config.js reads". It takes the variable names `app/src/config.js` reads
@@ -117,8 +122,14 @@ handles requests from residents and the hotline.
      apart from variables the final stage of the image sets with `ENV` in
      `deploy/Dockerfile` (the container gets them without compose; `NODE_ENV` at
      `deploy/Dockerfile:9`, which `config.js` will read once action item 1 is done) and
-     `NOT_NEEDED`, the per-service exemptions (today only `PORT` for `worker`: only the
-     API listens on a port, `app/src/server.js:95`);
+     `NOT_NEEDED`, the per-service exemptions: `PORT` for `worker`, because only the API
+     listens on a port (`app/src/server.js:95`), and `SMS_BASE_URL`, `SMS_TOKEN`,
+     `SMS_RATE_PER_SEC` and `COURIER_BASE_URL` for `api`, because only the worker sends SMS
+     and calls the courier (`app/src/worker.js:44`; the nightly job
+     `app/bin/expire-parcels.js:26` runs as the worker service). An exemption only stops
+     the rule asking for a variable: a service that sets it anyway passes, so the v1.7.3
+     compose, which gives them to `api`, stays a PASS, and a rename among them still fails
+     as an unknown name (check 1);
   3. no value of these variables can reach the container empty: `config.js` treats an
      empty value like a missing one (`Number("") || 4` is 4). A literal, `${VAR:?…}` and
      `${VAR:-literal}` pass; `""`, `${VAR}` without `:?` (compose substitutes a blank string
@@ -131,7 +142,7 @@ handles requests from residents and the hotline.
 
   The rule runs in CI before every deploy: the `test` job of `pipeline/deploy.yml` runs
   `npm run check:deploy`, and the `deploy` job needs it through `build`.
-- **Test:** `tools/test/compose-env.test.mjs`, 12 tests on the files of the incident
+- **Test:** `tools/test/compose-env.test.mjs`, 13 tests on the files of the incident
   (`config.js` and the Dockerfile did not change in v1.8.0). The v1.8.0 situation
   (`DB_POOL_SIZE` instead of `DB_POOL_MAX`) → FAIL on both counts: an unknown variable and
   a missing one. The v1.7.3 compose without `SMS_RATE_PER_SEC` → FAIL: a removal, not a
@@ -140,15 +151,17 @@ handles requests from residents and the hotline.
   service correctly has no `PORT`. A naive rule "every variable in compose is read by
   `config.js`" would fail on `TZ`, and a naive rule "every variable `config.js` reads is
   set in every service" would fail on `worker`. The other tests: the `PORT` exemption
-  holds for `worker` only, an image `ENV` counts only when it reaches the final stage,
+  holds for `worker` only; `api` may leave out the four SMS and courier variables while
+  `worker` may not, and a rename among them in `api` still fails; an image `ENV` counts
+  only when it reaches the final stage,
   `DB_POOL_MAX: ${DB_POOL_MAX}` without `:?`, `${DB_POOL_MAX:-${POOL}}`, an empty string
   and a bare `- SMS_TOKEN` are a FAIL while `${VAR:?…}` and `${VAR:-20}` pass, a service
   that does not run the app fails until `NOT_APP` names it, and a missing `config.js` is a
-  FAIL, not a pass. `npm run test:tools` → 32 tests, 32 pass. On the real v1.8.0 files, rebuilt from
-  `main` and the release diff:
+  FAIL, not a pass. `npm run test:tools` → 33 tests, 33 pass. On the real v1.8.0 files, rebuilt from
+  `c6800ab` (v1.7.3, the start of the homework) and the release diff:
 
   ```bash
-  d=$(mktemp -d) && git archive main app deploy | tar -x -C "$d" && (cd "$d" && git apply) < incident/changes/v1.8.0.diff && node tools/check-deploy.mjs --root "$d" | grep '^E1'
+  d=$(mktemp -d) && git archive c6800ab app deploy | tar -x -C "$d" && (cd "$d" && git apply) < incident/changes/v1.8.0.diff && node tools/check-deploy.mjs --root "$d" | grep '^E1'
   ```
 
   → `E1  FAIL ... api: not read by app/src/config.js: DB_POOL_SIZE; api: missing:
@@ -158,8 +171,8 @@ handles requests from residents and the hotline.
 - **Why it catches a class of problems, not only this incident:** every variable in
   `config.js` has a fallback (`app/src/config.js:6-15`), so any rename, typo or removal
   between the deploy file and the code changes the service silently: without
-  `SMS_RATE_PER_SEC` the SMS rate drops from the `"20"` set for both services in
-  `deploy/compose.yaml` to 5 (`app/src/config.js:13`). A rename or a typo leaves an unknown
+  `SMS_BASE_URL` the worker posts every SMS to `http://localhost:9001`
+  (`app/src/config.js:11`), and no resident gets a code. A rename or a typo leaves an unknown
   name (check 1) and a missing one (check 2); a removal leaves a missing one (check 2); a
   value moved out of the file and not provided, for example `${DB_POOL_MAX}` with no
   `DB_POOL_MAX` in `deploy/.env`, leaves an empty one (check 3), which ends in the same pool

@@ -18,9 +18,9 @@ Run 1 — `ai-runs/adr-without.md` (sees `app/` only). Run 2 — `ai-runs/adr-wi
 two files. Note: the prompt in both runs contained only the three points of the brief's
 "What we want" section (`materials/feature-brief.md:20-25`), so run 1 never saw the
 brief's own requirements (row 6, row 10). Those three points were given to both runs as
-the question and are not counted as constraints. Line numbers in `deploy/` refer to the
-starting state of the homework, commit `c6800ab` (`git show c6800ab:deploy/compose.yaml`),
-because Task D changes those files.
+the question and are not counted as constraints. `c6800ab:deploy/compose.yaml:34` is line
+34 of `git show c6800ab:deploy/compose.yaml`, the starting state of the homework: Task D
+changes the files in `deploy/`.
 
 ## Table
 
@@ -69,7 +69,7 @@ finds nothing in either run.
 - Run 1 treated the app default `smsRatePerSec: 5` (`app/src/config.js:13`) as the
   provider's limit (`adr-without.md:52`: "з лімітом ~5 запитів/с"); the provider's real
   limit is 10 messages/s (`materials/vendors/sms-provider.md:16`). Production overrides
-  the default with 20/s (`deploy/compose.yaml:34`), which neither run could see.
+  the default with 20/s (`c6800ab:deploy/compose.yaml:34`), which neither run could see.
 - Run 1 accepted "SMS «принаймні раз»" with possible duplicates
   (`adr-without.md:127`); the brief forbids duplicate codes
   (`materials/feature-brief.md:32-35`). The brief text was not in its input.
@@ -78,7 +78,7 @@ finds nothing in either run.
 - Run 1 says the pool `DB_POOL_MAX=4` is now shared by claim, finalisation and the API
   (`adr-without.md:129`). The API and the worker are separate processes, each with its
   own pool (`app/src/server.js:91`, `app/src/worker.js:43`), and production sets
-  `DB_POOL_MAX=20` (`deploy/compose.yaml:16`, `deploy/compose.yaml:30`).
+  `DB_POOL_MAX=20` (`c6800ab:deploy/compose.yaml:16`, `c6800ab:deploy/compose.yaml:30`).
 - Run 1 says several workers can run at once (`adr-without.md:121`). The rate pacing
   lives inside each process (`app/src/sms.js:17-25`), so N workers send at N times the
   rate.
@@ -90,7 +90,7 @@ finds nothing in either run.
   charge.
 - Run 2 says "пул має лише 4 з'єднання з очіканням 2 с" (`adr-with.md:73`): the code
   default (`app/src/config.js:9-10`), the same mix-up as run 1. Production sets
-  `DB_POOL_MAX=20` (`deploy/compose.yaml:16`, `deploy/compose.yaml:30`), which run 2
+  `DB_POOL_MAX=20` (`c6800ab:deploy/compose.yaml:16`, `c6800ab:deploy/compose.yaml:30`), which run 2
   could not see.
 - Run 2 asserts the winter duplicates were "Найімовірніше, це причина зимового
   інциденту" (`adr-with.md:36`) — inferred from the worker code

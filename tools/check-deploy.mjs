@@ -375,8 +375,12 @@ export const CONFIG_JS = "app/src/config.js";
 // Read by the runtime, not by config.js: TZ gives the logs their local time (app/src/log.js:2).
 export const RUNTIME_ENV = ["TZ"];
 // Variables config.js reads that a service does not need, per service: only the API
-// listens on a port (app/src/server.js:95).
-export const NOT_NEEDED = { worker: ["PORT"] };
+// listens on a port (app/src/server.js:95); only the worker sends SMS and calls the courier
+// (app/src/worker.js:44, app/bin/expire-parcels.js:26, run as the worker service).
+export const NOT_NEEDED = {
+  worker: ["PORT"],
+  api: ["SMS_BASE_URL", "SMS_TOKEN", "SMS_RATE_PER_SEC", "COURIER_BASE_URL"],
+};
 // Services that do not run this app (a proxy, a cache), each with its reason: E1 skips them,
 // so their own variables are neither demanded nor rejected. None today.
 export const NOT_APP = [];

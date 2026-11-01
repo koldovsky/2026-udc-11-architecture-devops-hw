@@ -41,10 +41,10 @@ numbers below refer to `docs/constraints.md`.
 - Of the code defaults that production overrides, two matter here. Line numbers in
   `deploy/` refer to commit `c6800ab`, the configuration production runs today
   (`git show c6800ab:deploy/compose.yaml`). The worker sends at `SMS_RATE_PER_SEC=20`
-  (`deploy/compose.yaml:34`), twice the provider's limit of 10/s (constraint 4), and each
-  process has a pool of `DB_POOL_MAX=20` (`deploy/compose.yaml:16`,
-  `deploy/compose.yaml:30`). The values 4 and 5/s in `app/src/config.js:9` and
-  `app/src/config.js:13` apply only when the variables are unset.
+  (`c6800ab:deploy/compose.yaml:34`), twice the provider's limit of 10/s (constraint 4), and each
+  process has a pool of `DB_POOL_MAX=20` (`c6800ab:deploy/compose.yaml:16`,
+  `c6800ab:deploy/compose.yaml:30`). The values 4 and 5/s in `app/src/config.js:9` and
+  `app/src/config.js:13` apply when a variable is unset, empty, `0` or not a number.
 - The SMS client has no request timeout (`app/src/sms.js:31-35`) and retries `429` with an
   exponential backoff of 400, 800 and 1600 ms that ignores `Retry-After`
   (`app/src/sms.js:36-39`). The courier client
@@ -110,11 +110,11 @@ we accept is more worker code and a single worker as a single point of failure
 - `parcel_id`, `kind` (`arrival`, `reminder_24`, `reminder_48`, `return`), with
   `UNIQUE (parcel_id, kind)` so each message kind exists once per parcel (5, 6);
 - `due_at` = `arrivedAt` + 0 / 24 / 48 / 72 h, stored in UTC;
-- `state`: `pending` → `claimed` → `sending` → `sent` | `unknown` | `failed`; `pending`
-  and `claimed` rows can also become `cancelled`. `claimed` means the worker has taken the
-  row and no request has started; `sending` means a request may have reached the
-  provider. A person closes `unknown` and `failed` rows as `resolved`, or sends an
-  `unknown` row back to `pending` (Appendix A, step 4);
+- `state`: `pending` → `claimed` → `sending` → `sent` | `unknown` | `failed`; `pending` and
+  `claimed` can become `cancelled`, and a row returns to `pending` when no request was made
+  or the message certainly did not go out. `claimed`: taken, no request started; `sending`:
+  a request may have reached the provider. A person, a pickup or a return closes `unknown`
+  and `failed` as `resolved`; a person can resend `unknown`. All transitions: Appendix F;
 - `lease_until`, `send_started_at`, `attempts`, `next_try_at`, `provider_msg_id`;
 - `resolved_by`, `resolved_at`, `resolution_note` for the person's decision.
 
@@ -223,7 +223,7 @@ unit; the texts are approved by the communications team (`materials/feature-brie
     send deadline in the SMS and courier clients, the resend / resolve script, and
     `GET /ops/tasks` for the existing monitoring. The nightly job and its cron line are
     retired.
-  - Configuration: worker `SMS_RATE_PER_SEC=5` (20 today) and `stop_grace_period: 30s`.
+  - Configuration: worker `SMS_RATE_PER_SEC=5` and `stop_grace_period: 30s` (set in Task D).
   - Process: propose the post-restore step to the owner of `docs/ops/backup-runbook.md`;
     get the arrival and reminder texts approved by the communications team, each within
     70 characters, the reminders worded as reminders; update `app/docs/ARCHITECTURE.md`
@@ -301,7 +301,7 @@ is relaxed:
    about two minutes for provider delay. Anything that falls due at night is sent at
    08:00, in priority order. The `return` task is not an SMS to the recipient and ignores
    the window.
-3. Rate (4): production sends at 20/s today (`deploy/compose.yaml:34`), above the
+3. Rate (4): production sends at 20/s today (`c6800ab:deploy/compose.yaml:34`), above the
    provider's 10/s. We pin `SMS_RATE_PER_SEC=5` for the worker: half the limit. A delivery
    of 300 parcels gets its arrival SMS in about a minute. Deliveries come mostly after
    lunch (`materials/feature-brief.md:44-45`), so the 24-hour and 48-hour reminders of the
@@ -465,7 +465,7 @@ person (9) for nothing they need to do before 08:00; a row that turns `unknown` 
 row is `resolved` or back in `pending`, so a handled row does not keep it red and a new
 problem is not hidden behind an old one. Alerts go to `#poshtomat-oncall`.
 
-The API port is published (`deploy/compose.yaml:9-10`), and like `/health` the endpoint
+The API port is published (`c6800ab:deploy/compose.yaml:9-10`), and like `/health` the endpoint
 needs no session. It therefore answers only `ok` or `problem` with the status code, which
 tells an outsider nothing more, and it runs no counting query: it reads the
 `worker_status` row by its key, and the API caches that read for 5 s, so a flood of
@@ -484,7 +484,7 @@ The detailed list behind "What has to be done" in Consequences.
   `worker_status` row (heartbeat and check flags).
 - **Migration.** First stop the old worker with a long timeout
   (`docker compose stop -t 120 worker`): on `SIGTERM` it finishes its current round
-  before it exits (`app/src/worker.js:52-58`), and the default 10 s could kill it between
+  before it exits (`app/src/worker.js:52-58`), and a short grace period could kill it between
   a send and the `notifiedAt` write. Check that it exited by itself
   (`docker compose ps -a worker` shows exit code 0, not 137); if it was killed, check the
   parcels of its last batch by hand before the backfill. Then the backfill writes the
@@ -517,9 +517,9 @@ The detailed list behind "What has to be done" in Consequences.
   which class a failure belongs to (not sent, rejected, unknown). Today the `429` retries
   run inside `send` with no such check (`app/src/sms.js:29-41`).
 - **Courier client** (`app/src/courier.js`): a 10 s request timeout.
-- **Compose** (`deploy/compose.yaml`, worker service): `SMS_RATE_PER_SEC=5` (20 today) and
-  `stop_grace_period: 30s`. Docker's default of 10 s can kill the worker before the
-  request in flight ends and its result is written (Appendix A, step 7).
+- **Compose** (`deploy/compose.yaml`, worker service): `SMS_RATE_PER_SEC=5` (20 at `c6800ab`)
+  and `stop_grace_period: 30s`, both set in Task D. Docker's default of 10 s can kill the
+  worker before the request in flight ends and its result is written (Appendix A, step 7).
 - **Monitoring.** Add `GET /ops/tasks` (one read of `worker_status` by key, cached for
   5 s) and point the existing monitoring at it (Appendix D).
 - **Backup runbook.** Propose the post-restore step (SMS and `return` rows, decided by the
@@ -528,3 +528,28 @@ The detailed list behind "What has to be done" in Consequences.
 - **SMS texts.** Get the arrival and reminder texts approved by the communications team,
   each within 70 characters, the reminders worded as reminders.
 - **Documentation.** Update `app/docs/ARCHITECTURE.md` after the change.
+
+### F. Task state transitions
+
+Every change of `parcel_tasks.state`, collected from Decision → Data and Appendices A–C.
+A write that changes the state matches the state it expects, so a row that has moved on
+meanwhile is not touched.
+
+| From | To | Trigger | Where |
+|---|---|---|---|
+| — | `pending` | the parcel is registered (four rows in its transaction), or the backfill | Decision → Data; E |
+| `pending` | `claimed` | the claim takes a due row of a `waiting` parcel; SMS rows only 08:00–20:55 | A, steps 1–2 |
+| `claimed` | `sending` | the short write right before the request; for a return, together with `waiting` → `return_pending` | A, step 1; B |
+| `claimed` | `pending` | no request was made: the 20:58 cut-off, an expired lease found by the sweep, `SIGTERM` | A, steps 2, 5, 7 |
+| `pending`, `claimed` | `cancelled` | a pickup or the start of a return (the parcel's SMS rows); a reminder overdue past the next step | Decision → Data; A, step 6; B |
+| `sending` | `sent` | SMS: `2xx`, with `provider_msg_id`; return: the courier answered and the parcel is `returned` | A, step 4; B |
+| `sending` | `pending` | the message certainly did not go out: `429` (also a retry dropped at the cut-off or on `SIGTERM`), a refused connection, a failed DNS lookup or TLS handshake, `401` / `403`; a return: a refused connection | A, steps 2, 4, 7; B |
+| `sending` | `failed` | `400` | A, step 4 |
+| `sending` | `unknown` | a timeout, a connection dropped after the request was sent, any `5xx`, an expired lease (crash or kill); a return: a timeout, `4xx` or `5xx` | A, steps 4–5; B |
+| `sending` | `resolved` | a result that would leave `unknown` or `failed` for a parcel picked up or returned meanwhile | A, step 6 |
+| `unknown` | as from `sending` | the late result of the same claim (its `lease_until` still matches), for example a slow send that succeeded | A, step 5 |
+| `unknown` | `pending` | a person resends the row (`attempts` + 1) | A, step 4 |
+| `unknown`, `failed` | `resolved` | a person resolves the row; a pickup or the start of a return closes the parcel's SMS rows | A, step 4; Decision → Data; B |
+| `pending`, `claimed`, `sending` | `unknown` | the post-restore step, for rows due before the restore moment that may have run since the dump | C |
+
+`sent`, `cancelled` and `resolved` are final.

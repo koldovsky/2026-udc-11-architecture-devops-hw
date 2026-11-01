@@ -34,15 +34,24 @@ x-app: &app
 
 # What app/src/config.js reads, plus TZ for the runtime (local timestamps in the logs,
 # app/src/log.js:2). Rule E1 in tools/check-deploy.mjs compares this with config.js.
+# x-env holds what both services need.
 x-env: &env
   TZ: "Europe/Kyiv"
   LOG_LEVEL: "info"
   DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
   DB_POOL_MAX: "20"
   DB_POOL_WAIT_MS: "2000"
+
+# Only the worker sends SMS and calls the courier (app/src/worker.js:44, and the nightly job
+# app/bin/expire-parcels.js:26, which runs as this service: docs/ops/backup-runbook.md:18-19).
+# The API never does, so it does not get the token; E1 knows this from NOT_NEEDED.
+x-worker-env: &worker-env
+  <<: *env
   SMS_BASE_URL: "https://sms.example.net/api/v2"
   SMS_TOKEN: ${SMS_TOKEN:?set SMS_TOKEN in deploy/.env}
-  SMS_RATE_PER_SEC: "20"
+  # Half the provider's limit of 10 messages/s; above it the provider answers 429 and does
+  # not send the message (materials/vendors/sms-provider.md:16-17).
+  SMS_RATE_PER_SEC: "5"
   COURIER_BASE_URL: "https://courier.example.com/api/v1"
 
 services:
@@ -64,9 +73,12 @@ services:
     <<: *app # the image api builds
     command: ["node", "src/worker.js"]
     environment:
-      <<: *env # no PORT: the worker does not listen
+      <<: *worker-env # no PORT: the worker does not listen
     healthcheck:
       disable: true # no HTTP server; the image's HEALTHCHECK calls /health of the API
     mem_limit: 256m
     cpus: 0.5
-    stop_grace_period: 15s
+    # On SIGTERM the worker finishes its round, up to 50 SMS (10 s at 5/s, longer with 429
+    # retries), and may then sleep 10 s before it stops (app/src/worker.js:52-66). A kill
+    # inside the round, between a send and its notifiedAt write, repeats that SMS.
+    stop_grace_period: 30s

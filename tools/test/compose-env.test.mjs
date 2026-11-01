@@ -50,7 +50,7 @@ const SHARED = {
   COURIER_BASE_URL: "https://courier.example.com/api/v1",
 };
 
-// deploy/compose.yaml of v1.7.3 (git show main:deploy/compose.yaml), environment edited by each test
+// deploy/compose.yaml of v1.7.3 (git show c6800ab:deploy/compose.yaml), environment edited by each test
 function composeV173({ api = (env) => env, worker = (env) => env } = {}) {
   return {
     services: {
@@ -114,6 +114,19 @@ test("E1: the PORT exemption is for worker only", () => {
   const result = e1({ compose: composeV173({ api: without("PORT") }) });
   assert.equal(result.status, "FAIL");
   assert.equal(result.message, "api: missing: PORT");
+});
+
+test("E1: api may leave out the SMS and courier variables, which only the worker uses; worker may not", () => {
+  const workerOnly = without("SMS_BASE_URL", "SMS_TOKEN", "SMS_RATE_PER_SEC", "COURIER_BASE_URL");
+  assert.equal(e1({ compose: composeV173({ api: workerOnly }) }).status, "PASS");
+  // (not SMS_TOKEN here: the v1.7.3 image sets it with ENV, so E1 counts it as set)
+  const missing = e1({ compose: composeV173({ worker: without("SMS_BASE_URL") }) });
+  assert.equal(missing.status, "FAIL");
+  assert.equal(missing.message, "worker: missing: SMS_BASE_URL");
+  // the exemption does not hide a rename in api: the new name is still unknown
+  const renamedInApi = e1({ compose: composeV173({ api: renamed("SMS_TOKEN", "SMS_KEY") }) });
+  assert.equal(renamedInApi.status, "FAIL");
+  assert.equal(renamedInApi.message, "api: not read by app/src/config.js: SMS_KEY");
 });
 
 test("E1: an unknown variable alone fails — a typo added next to the right name", () => {
