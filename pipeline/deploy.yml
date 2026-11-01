@@ -1,0 +1,138 @@
+# Deploy pipeline: tests and deploy checks → image build and smoke run → deploy to the VM
+# after manual approval. Pull requests to main run the tests and the build only.
+#
+# It lives in pipeline/ so that it never runs in the course repository; the team's
+# repository keeps it under .github/workflows/.
+#
+# Repository settings it needs:
+#   Environment "production": required reviewers (the manual approval), deployment branch main.
+#   Environment secrets: DEPLOY_HOST, DEPLOY_USER, DEPLOY_SSH_KEY (private key of the deploy
+#     user, who may run docker on the VM), DEPLOY_KNOWN_HOSTS (the VM's host key line).
+#   Environment variable: DEPLOY_PATH, the git checkout of this repository on the VM: an
+#     absolute path of letters, digits and . _ / - only. That checkout must be able to
+#     `git fetch origin`.
+# SMS_TOKEN stays in deploy/.env on the VM (deploy/compose.yaml) and never passes through CI;
+# that file must be readable by DEPLOY_USER, or the deploy stops before it changes the checkout.
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  # pull_request, not pull_request_target: code from a pull request runs without secrets and
+  # with the read-only token of `permissions:` below
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# One run per branch at a time, so runs of main deploy in push order and an older commit never
+# replaces a newer one on the VM. While a deploy waits for approval, the next run of main waits
+# too; a newer one replaces it in the queue (it contains the same commits). The group is per
+# ref: a pull request or a workflow_dispatch on another branch (tests and build only, see the
+# deploy job's if:) cannot cancel a queued run of main.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: App tests
+        working-directory: app
+        run: npm test
+      - name: Tests of the deploy checks
+        run: npm run test:tools
+      - name: Deploy checks, including compose against app/src/config.js (rule E1)
+        run: npm run check:deploy
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      IMAGE_TAG: ${{ github.sha }}
+      # The store of this service is in memory (app/src/db.js): fresh containers start without
+      # the database and have no parcels, so the worker sends nothing with this dummy token.
+      SMS_TOKEN: ci-dummy
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Build the image and start api and worker with the production compose file
+        run: docker compose -f deploy/compose.yaml up -d --build --wait --wait-timeout 120
+      - name: Run the nightly job the way cron on the VM runs it
+        run: docker compose -f deploy/compose.yaml run --rm worker npm run expire
+      - name: Container logs
+        if: always()
+        run: docker compose -f deploy/compose.yaml logs --no-color
+
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    steps:
+      - name: Set up SSH
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/deploy_key
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/deploy_key ~/.ssh/known_hosts
+      - name: Switch the VM checkout to this commit and rebuild there
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+        # The script below runs on the VM: $1 is the checkout, $2 the commit. --wait waits for the
+        # API's HEALTHCHECK, which calls /health: a liveness check that does not touch the
+        # database. A deploy that fails after the switch leaves the checkout on the new commit and
+        # is rolled back by hand (docs/runbook.md, "Rollback"). A readiness check and an automatic rollback are
+        # post-mortem action items 5, 6 and 11 (docs/postmortem.md).
+        run: |
+          # ssh hands its arguments to the VM's shell as one string, so quotes do not survive:
+          # a space or a shell character in the path would split it or run as shell syntax there
+          if [[ ! "$DEPLOY_PATH" =~ ^/[A-Za-z0-9._/-]+$ ]]; then
+            echo "DEPLOY_PATH must be an absolute path of letters, digits and . _ / - (got '$DEPLOY_PATH')" >&2
+            exit 1
+          fi
+          ssh -i ~/.ssh/deploy_key -o BatchMode=yes -o StrictHostKeyChecking=yes \
+            "${DEPLOY_USER}@${DEPLOY_HOST}" bash -s -- "$DEPLOY_PATH" "$GITHUB_SHA" <<'VM'
+          set -euo pipefail
+          cd "$1"
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "local changes in $1, not deploying over them:" >&2
+            git status --short >&2
+            exit 1
+          fi
+          # deploy/.env keeps SMS_TOKEN; IMAGE_TAG names the commit the image is built from.
+          # A file this user cannot read would be replaced below without its SMS_TOKEN: stop
+          # instead, before the switch, so the checkout stays on the commit it was on.
+          if [ ! -r deploy/.env ]; then
+            echo "deploy/.env in $1 is missing or not readable by $(id -un); it must hold SMS_TOKEN" >&2
+            exit 1
+          fi
+          git fetch --tags origin
+          git switch --detach "$2"
+          # The new file is private from the moment it exists: umask 077, in a subshell so that it
+          # applies to this file alone. rm first: umask does not change a file left by a failed run.
+          # grep exits 1 when IMAGE_TAG is the only line; any other failure stops the deploy.
+          rm -f deploy/.env.new
+          ( umask 077; { grep -v '^IMAGE_TAG=' deploy/.env || [ $? -eq 1 ]; printf 'IMAGE_TAG=%s\n' "$2"; } > deploy/.env.new )
+          mv deploy/.env.new deploy/.env
+          docker compose -f deploy/compose.yaml up -d --build --wait --wait-timeout 120
+          docker compose -f deploy/compose.yaml ps
+          VM
