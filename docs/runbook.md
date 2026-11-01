@@ -38,14 +38,18 @@ the SMS provider. Look at them only if the steps below point there.
 
 1. Acknowledge the page in `#poshtomat-oncall`.
 2. Find the deployment directory, switch to the deploy user, then check which version runs
-   and how long the containers have been up:
+   and how long the containers have been up. The block finds both values itself and needs
+   no editing: the checkout (`DEPLOY_PATH` of the pipeline) from the compose file of the
+   running project, and the deploy user (`DEPLOY_USER`) as the owner of `deploy/.env`. Run
+   it one line at a time: `sudo -iu` opens a new shell, and the lines after it run there.
 
    ```bash
    ssh poshtomat-prod-1
-   sudo docker compose ls                        # CONFIG FILES: <dir>/deploy/compose.yaml of the running project
-   sudo stat -c '%U %a' <dir>/deploy/.env        # "<deploy user> 600": the owner is the deploy user
-   sudo -iu <deploy user>                        # every command from here on runs as this user
-   cd <dir>                                      # the directory that holds deploy/
+   DIR=$(sudo docker compose ls -a --format json | grep -o '"ConfigFiles":"[^"]*"' | cut -d'"' -f4 | sed 's#/deploy/compose.yaml$##')
+   echo "$DIR"                                   # one absolute path; empty or more than one line: stop and escalate
+   sudo stat -c '%U %a' "$DIR/deploy/.env"       # "<owner> 600": the owner is the deploy user
+   sudo -iu "$(sudo stat -c '%U' "$DIR/deploy/.env")"   # every command from here on runs as this user
+   cd "$(docker compose ls -a --format json | grep -o '"ConfigFiles":"[^"]*"' | cut -d'"' -f4 | sed 's#/deploy/compose.yaml$##')"
    git log -1 --format='%h %ci %s'               # the deployed commit and its time
    curl -s http://localhost:8080/health          # {"status":"ok","version":"<version>"}
    docker compose -f deploy/compose.yaml ps      # STATUS column: "Up 12 minutes" = recent (re)start
@@ -106,11 +110,11 @@ the SMS provider. Look at them only if the steps below point there.
 | Question | Command or place | How to read the result |
 |---|---|---|
 | 1. What do the failures say? | `docker compose -f deploy/compose.yaml logs --since 15m --no-log-prefix api \| grep '"level":"error"' \| grep -o '"error":"[^"]*"' \| sort \| uniq -c \| sort -rn` | `db pool wait timeout after 2000ms` at the top — requests wait for a database connection: continue with 2. Any other message on top — follow that message; this runbook does not cover it |
-| 2. Is the pool too small or the database too slow? | Metrics `db_pool_in_use` and `db_pool_waiting` for the last 30 minutes, next to the same hours yesterday. The monitoring dashboard address is not in this repository yet. From a per-minute CSV export in the format of `incident/metrics/` (`ts,rps,p95_ms,error_rate,db_pool_in_use,db_pool_waiting,heap_used_pct,sms_429_per_min`): `awk -F, 'NR>1 {print substr($1,12,5), "in_use", $5, "waiting", $6}' <export>.csv \| tail -30`, for today's and yesterday's export | `db_pool_in_use` flat at one number below 20 (for example exactly 4) while `db_pool_waiting > 0` — the pool is smaller than configured: go to 3. `db_pool_in_use` at 20 and waiting — the database or the load: go to 4 and 5 |
+| 2. Is the pool too small or the database too slow? | Metrics `db_pool_in_use` and `db_pool_waiting` for the last 30 minutes, next to the same hours yesterday. The monitoring dashboard address is not in this repository yet. Save the per-minute CSV exports of today and of the same hours yesterday, in the format of `incident/metrics/` (`ts,rps,p95_ms,error_rate,db_pool_in_use,db_pool_waiting,heap_used_pct,sms_429_per_min`), as `today.csv` and `yesterday.csv` in the current directory, then: `for f in today.csv yesterday.csv; do echo "$f"; awk -F, 'NR>1 {print substr($1,12,5), "in_use", $5, "waiting", $6}' "$f" \| tail -30; done` | `db_pool_in_use` flat at one number below 20 (for example exactly 4) while `db_pool_waiting > 0` — the pool is smaller than configured: go to 3. `db_pool_in_use` at 20 and waiting — the database or the load: go to 4 and 5 |
 | 3. What pool size does the running API use? | `docker compose -f deploy/compose.yaml exec api node -e 'import("./src/config.js").then(({ loadConfig }) => { const c = loadConfig(); console.log("dbPoolMax", c.dbPoolMax, "dbPoolWaitMs", c.dbPoolWaitMs); })'` | `dbPoolMax 20` — as intended. Any other number — the configuration is wrong. The command prints only the two pool values, never the tokens |
 | 3a. Is the variable set at all? | `docker compose -f deploy/compose.yaml exec api printenv DB_POOL_MAX` | `20` — set. Empty output — missing (the 2026-10-14 case: it had been renamed to `DB_POOL_SIZE`, which the code does not read, so the code used its default of 4) |
 | 4. Is the database answering? | `pg_isready -h 192.0.2.10 -p 5432` | `accepting connections` — the server is up; anything else — escalate to the infrastructure developer (owner of the VM and the database). Between 02:00 and 02:30 the backup blocks writes by design (`docs/ops/backup-runbook.md`) |
-| 5. Is the load unusual? | Metric `rps` now vs the same time yesterday; from the CSV export of question 2: `awk -F, 'NR>1 {print substr($1,12,5), "rps", $2}' <export>.csv \| tail -10`, for today's and yesterday's export | about the same (the afternoon peak is ~12 requests per second) — not a load problem; much higher — escalate, find the source |
+| 5. Is the load unusual? | Metric `rps` now vs the same time yesterday; from the two exports of question 2: `for f in today.csv yesterday.csv; do echo "$f"; awk -F, 'NR>1 {print substr($1,12,5), "rps", $2}' "$f" \| tail -10; done` | about the same (the afternoon peak is ~12 requests per second) — not a load problem; much higher — escalate, find the source |
 
 ## How to confirm the cause
 
@@ -153,7 +157,9 @@ release, without waiting for the pipeline and its approval.
 A release is a commit, not a tag (`deploy/compose.yaml:3`): the pipeline neither tags it nor
 writes the deploy history. The checkout remembers every switch in its reflog, so the release
 that ran before is the one the latest switch moved from. The first two commands check the
-checkout, the third finds that release. Run them as the deploy user (step 2 of "First 5
+checkout; the next three show the reflog, take `<previous>` from its top line into `PREV`
+and print it next to the running commit, so the block needs no editing. Run it line by
+line and stop at the first check that fails. Run it as the deploy user (step 2 of "First 5
 minutes"), after the API log is saved (step 3): the `sed` line rewrites `deploy/.env`,
 which only that user can write.
 
@@ -161,17 +167,22 @@ which only that user can write.
 git rev-parse --is-inside-work-tree                 # "true" = a git checkout
 git status --short                                  # empty = no local edits on the VM
 git reflog -n 5 --format='%h %gs'                   # top line: "checkout: moving from <previous> to <current>"
-git switch --detach <previous>                      # app/ and deploy/ of the previous release together
+PREV=$(git reflog -n 1 --format='%gs' | sed -n 's/^checkout: moving from \(.*\) to [^ ]*$/\1/p')
+echo "previous: ${PREV:-none}, running: $(git rev-parse HEAD)"   # "none": the top line is not a checkout
+git switch --detach "$PREV"                         # app/ and deploy/ of the previous release together
 sed -i "s/^IMAGE_TAG=.*/IMAGE_TAG=$(git rev-parse HEAD)/" deploy/.env   # the image tag names the commit it is built from
 docker compose -f deploy/compose.yaml up -d --build --wait
 ```
 
-`<previous>` is a commit, or the branch name `main` when the latest switch was the first
-pipeline deploy over a checkout updated by hand. `<current>` in the top line must be the
-running commit (`git rev-parse HEAD`; the pipeline switches by the full hash); if a rollback has already been done, the top
-line is that rollback, so read the lines below it. Anything other than `true`, any output
-from `git status --short`, or a top line that is not `checkout: moving from …` — stop and
-call the release author or the infrastructure developer. Without the `sed` line the
+`PREV` is a commit, or the branch name `main` when the latest switch was the first
+pipeline deploy over a checkout updated by hand. The `<current>` of the line used must be
+the running commit that `echo` prints (the pipeline switches by the full hash). If a
+rollback has already been done, the top line is that rollback: it undoes the line below
+it (`moving from B to A` over `moving from A to B`), and `PREV` would name the broken
+release. Then take the line under those two: run the `PREV=` line again with `--skip=2`
+after `-n 1`, and check the `echo` again. Anything other than `true`, any output from
+`git status --short`, `previous: none`, or a `<current>` that is not the running commit —
+stop and call the release author or the infrastructure developer. Without the `sed` line the
 previous release's code would be built under the tag of the broken commit. A release from
 before the pipeline (v1.8.0 and older) has its own compose file with the fixed image
 `poshtomat:latest` and no `IMAGE_TAG`; there the `sed` line changes nothing compose reads.
@@ -199,8 +210,8 @@ later: merge the fix to `main`, and the pipeline deploys it after approval.
   and the project coordinator, who handles the hotline: some parcels may be marked as
   picked up while the door did not open, and fast failures can be among them too
   (`docs/rca.md`, "Side effect to check"; post-mortem action item 8). Count them in the log
-  saved in step 3 of "First 5 minutes":
-  `grep -c '"path":"/pickup","status":503' ~/api-<time>.jsonl`. After a rollback or a
+  saved in step 3 of "First 5 minutes", the newest `~/api-*.jsonl`:
+  `grep -c '"path":"/pickup","status":503' "$(ls -t ~/api-*.jsonl | head -1)"`. After a rollback or a
   configuration fix, `docker compose logs` shows only the new containers, so it cannot give
   this count; if the log was not saved, say so, and the database query of action item 8
   gives the parcels instead.
