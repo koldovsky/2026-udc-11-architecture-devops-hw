@@ -20,10 +20,12 @@
   docker compose -f deploy/compose.yaml down
   ```
 
-  Еквівалент для bash (як у шапці compose):
+  Еквівалент для bash (як у шапці compose, `deploy/compose.yaml:16-18`):
 
   ```bash
-  IMAGE_TAG=local DATABASE_URL=CHANGE_ME SMS_TOKEN=CHANGE_ME   SMS_BASE_URL=http://localhost:9001 COURIER_BASE_URL=http://localhost:9002   docker compose -f deploy/compose.yaml up -d --build
+  IMAGE_TAG=local DATABASE_URL=CHANGE_ME SMS_TOKEN=CHANGE_ME \
+  SMS_BASE_URL=http://localhost:9001 COURIER_BASE_URL=http://localhost:9002 \
+  docker compose -f deploy/compose.yaml up -d --build
   ```
 
 - Вивід `docker compose -f deploy/compose.yaml ps` (~40 с після старту) — `api` `healthy`;
@@ -31,14 +33,17 @@
 
   ```text
   NAME              IMAGE             COMMAND                  SERVICE   CREATED          STATUS                    PORTS
-  deploy-api-1      poshtomat:local   "docker-entrypoint.s…"   api       43 seconds ago   Up 42 seconds (healthy)   127.0.0.1:8080->8080/tcp
-  deploy-worker-1   poshtomat:local   "docker-entrypoint.s…"   worker    43 seconds ago   Up 42 seconds             8080/tcp
+  deploy-api-1      poshtomat:local   "docker-entrypoint.s…"   api       40 seconds ago   Up 40 seconds (healthy)   127.0.0.1:8080->8080/tcp
+  deploy-worker-1   poshtomat:local   "docker-entrypoint.s…"   worker    40 seconds ago   Up 40 seconds             8080/tcp
   ```
 
   Чому `worker` без healthcheck: `worker.js` не піднімає HTTP-сервера (`app/src/worker.js:40-58` —
   лише цикл опитування; `http.createServer`/`listen` є тільки в `app/src/server.js:93-95`), тож
   успадкований з образу `HEALTHCHECK` на `:8080/health` (`deploy/Dockerfile:18-19`) завжди падав би
-  і позначав його `unhealthy` — тому в `deploy/compose.yaml:69-72` стоїть `healthcheck: disable: true`.
+  і позначав його `unhealthy` — тому в `deploy/compose.yaml:73-76` стоїть `healthcheck: disable: true`.
+  Для `api` окремого `healthcheck:` у compose немає — діє той самий `HEALTHCHECK` з образу
+  (`docker inspect deploy-api-1 --format '{{json .Config.Healthcheck}}'` → `wget -qO- http://localhost:8080/health`,
+  30s / 5s / 15s / 3); у worker `docker inspect` показує `"Test":["NONE"]`.
   `8080/tcp` у колонці PORTS для worker — це лише `EXPOSE` з образу, порт на хост не опубліковано.
 
 - Запит до `GET /health` і відповідь:
@@ -47,7 +52,9 @@
   > curl.exe -s -i http://localhost:8080/health
   HTTP/1.1 200 OK
   content-type: application/json; charset=utf-8
+  Date: Mon, 02 Nov 2026 15:04:07 GMT
   Connection: keep-alive
+  Keep-Alive: timeout=5
   Transfer-Encoding: chunked
 
   {"status":"ok","version":"1.7.3"}
@@ -56,8 +63,8 @@
   Логи (`docker compose ... logs --no-log-prefix api worker`):
 
   ```text
-  {"ts":"2026-11-02T16:31:41.711+02:00","level":"info","msg":"service started","version":"1.7.3"}
-  {"ts":"2026-11-02T16:31:41.822+02:00","level":"info","msg":"worker started","version":"1.7.3"}
+  {"ts":"2026-11-02T17:03:26.533+02:00","level":"info","msg":"service started","version":"1.7.3"}
+  {"ts":"2026-11-02T17:03:26.581+02:00","level":"info","msg":"worker started","version":"1.7.3"}
   ```
 
   Помилок SMS у логах worker немає, і це не означає, що SMS «працюють»: сховище в репо — у пам'яті
@@ -70,39 +77,9 @@
 - Що пішло не так і як полагодили: стек піднявся з першої спроби, правок у `deploy/` не знадобилося.
   Нюанси: (1) `docker` доступний лише з PowerShell, тому змінні задано через `$env:` в тій самій
   команді, а `.env` не створювали; (2) без будь-якої з обов'язкових змінних compose падає ще до
-  старту через `${VAR:?…}` (`deploy/compose.yaml:26-29,32`) — це очікувано; (3) після перевірки
+  старту через `${VAR:?…}` (`deploy/compose.yaml:28-31,36`) — це очікувано; (3) після перевірки
   стек зупинено `docker compose -f deploy/compose.yaml down` (образ `poshtomat:local` лишився).
 
-## Шлях 2 — STRIDE для архітектури з вашого ADR
+## Шлях 2 — STRIDE для архітектури з вашого ADR — не обрано
 
-Чотири питання Адама Шостака.
-
-1. **Над чим ми працюємо?** <компоненти, потоки даних і межі довіри — можна послатися на
-   `docs/architecture.md` і `docs/adr/0001-notifications.md`>
-2. **Що може піти не так?** і 3. **Що ми з цим робитимемо?**
-
-| # | Елемент або потік | STRIDE | Загроза | Що робимо | Залишковий ризик |
-|---|---|---|---|---|---|
-| 1 | <...> | <S / T / R / I / D / E> | <...> | <...> | <...> |
-
-_Приклад: «1 | Пацієнт → API: перегляд запису | I (Information disclosure) | чужий запис
-за ID, який легко вгадати | перевірка, що запис належить сесії, + непередбачувані ID |
-низький»._
-
-S — Spoofing, T — Tampering, R — Repudiation, I — Information disclosure,
-D — Denial of service, E — Elevation of privilege.
-
-4. **Чи добре ми впоралися?** <що перевірили, що свідомо лишили, коли переглянути модель>
-
-## Шлях 3 — оцінка вартості
-
-| Компонент з ADR | Сервіс і тариф | Ціна за одиницю | Джерело (посилання, дата перевірки) | Обсяг на місяць (припущення) | Сума на місяць |
-|---|---|---|---|---|---|
-| <...> | <...> | <...> | <...> | <...> | <...> |
-
-_Приклад: «Сховище сканів | об'єктне сховище, стандартний клас | <ціна за ГБ-місяць> |
-<посилання на сторінку тарифів>, перевірено <дата> | 120 ГБ | <сума>»._
-
-**Разом на місяць:** <…>
-**Звідки обсяги:** <...>
-**Що найбільше впливає на суму і як її зменшити:** <...>
+## Шлях 3 — оцінка вартості — не обрано

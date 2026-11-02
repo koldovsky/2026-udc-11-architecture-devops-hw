@@ -253,7 +253,8 @@
   - `deploy/compose.yaml`: `SMS_RATE_PER_SEC` з `"20"` (на `main` рядки 20, 34) на `"5"`; для
     worker — `stop_grace_period: 30s` і `restart: unless-stopped`. На `main` політики `restart:`
     немає (рядки 23-35), тож упалий worker сам не піднімається, і «не губити код» тримається
-    лише до першого падіння (у робочій копії Task D `restart` уже додано);
+    лише до першого падіння (у робочій копії Task D `restart` і `SMS_RATE_PER_SEC: "5"` уже
+    зроблено, `deploy/compose.yaml:25-27`);
   - `app/src/worker.js`: новий рядок логу на кожну зміну стану завдання — `job_id`, `kind`,
     `state`, `parcel_id`, час (без номера й коду). Зараз worker логує лише `parcel_id` і помилку
     при невдачі (`app/src/worker.js:30`) та кількість надісланих (`:36`);

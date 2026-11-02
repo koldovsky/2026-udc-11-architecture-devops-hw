@@ -16,8 +16,6 @@ jobs:
     name: Test
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    permissions:
-      contents: read
     defaults:
       run:
         working-directory: app
@@ -44,6 +42,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # The one place the deploy tag is defined: metadata-action and the deploy job both use it.
       - id: tag
         run: echo "value=sha-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
 
@@ -59,8 +58,10 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
+          # Never push :latest — deploys always use the explicit sha tag.
+          flavor: latest=false
           tags: |
-            type=sha,prefix=sha-,format=long
+            type=raw,value=${{ steps.tag.outputs.value }}
             type=semver,pattern={{version}}
 
       - uses: docker/build-push-action@v6
@@ -88,50 +89,56 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: production   # → Settings › Environments › production: add required reviewers
-    permissions:
-      contents: read
     env:
       IMAGE: ghcr.io/${{ github.repository }}
       IMAGE_TAG: ${{ needs.build.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
 
+      # All DEPLOY_* secrets are read here once and turned into the ssh host alias `prod`;
+      # the steps below are plain scp/ssh. DEPLOY_KNOWN_HOSTS = `ssh-keyscan -p <port> <host>`
+      # output checked by hand once — the host key is verified, not trusted on first use.
+      - name: Configure SSH access
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          # metadata-action pushes a lowercase image name; pull exactly that.
+          echo "IMAGE=${IMAGE,,}" >> "$GITHUB_ENV"
+          install -m 700 -d ~/.ssh
+          install -m 600 /dev/null ~/.ssh/deploy_key
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<EOF
+          Host prod
+            HostName $DEPLOY_HOST
+            User $DEPLOY_USER
+            Port ${DEPLOY_PORT:-22}
+            IdentityFile ~/.ssh/deploy_key
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+          EOF
+
       # Push the latest compose file to the server.
       - name: Upload compose file
-        uses: appleboy/scp-action@v0.1.7
-        with:
-          host: ${{ secrets.DEPLOY_HOST }}
-          username: ${{ secrets.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          port: ${{ secrets.DEPLOY_PORT }}
-          source: deploy/compose.yaml
-          target: /opt/poshtomat
-          strip_components: 1
+        run: scp deploy/compose.yaml prod:/opt/poshtomat/compose.yaml
 
       # Pull the new image and recreate containers (short downtime while compose recreates them).
-      # GHCR_TOKEN is a PAT with packages:read scope, stored in repo secrets.
-      # It is passed to the remote shell as an env var (never as a CLI arg)
-      # so it does not appear in the remote process list or shell history.
+      # GHCR_TOKEN is a PAT with packages:read scope, stored in repo secrets. It goes to the
+      # remote docker login through stdin (never as a CLI arg), so it does not appear in the
+      # remote process list or shell history.
       - name: Pull image and restart services
-        uses: appleboy/ssh-action@v1.2.0
         env:
           GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
-        with:
-          host: ${{ secrets.DEPLOY_HOST }}
-          username: ${{ secrets.DEPLOY_USER }}
-          key: ${{ secrets.DEPLOY_SSH_KEY }}
-          port: ${{ secrets.DEPLOY_PORT }}
-          envs: GHCR_TOKEN
-          script: |
-            set -euo pipefail
-            echo "$GHCR_TOKEN" | docker login ghcr.io \
-              -u "${{ github.repository_owner }}" --password-stdin
-
+          GHCR_USER: ${{ github.repository_owner }}
+        run: |
+          printf '%s\n' "$GHCR_TOKEN" | ssh prod "docker login ghcr.io -u '$GHCR_USER' --password-stdin"
+          ssh prod "set -eu
             cd /opt/poshtomat
-            IMAGE="${{ env.IMAGE }}" IMAGE_TAG="${{ env.IMAGE_TAG }}" \
-              docker compose pull --quiet api worker
-
-            IMAGE="${{ env.IMAGE }}" IMAGE_TAG="${{ env.IMAGE_TAG }}" \
-              docker compose up -d --remove-orphans --no-build
-
-            docker image prune -f
+            export IMAGE='$IMAGE' IMAGE_TAG='$IMAGE_TAG'
+            docker compose pull --quiet api worker
+            docker compose up -d --remove-orphans --no-build
+            docker image prune -f"

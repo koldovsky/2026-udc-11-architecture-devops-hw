@@ -405,10 +405,10 @@ function appEnvReads(root) {
  */
 function splitAppServices(all) {
   const built = all.filter(([, svc]) => svc?.build);
-  if (!built.length) return { app: all, thirdParty: [] };
+  if (!built.length) return { appServices: all, thirdPartyServices: [] };
   const images = new Set(built.map(([, svc]) => svc?.image).filter(Boolean));
   const isApp = ([, svc]) => Boolean(svc?.build) || images.has(svc?.image);
-  return { app: all.filter(isApp), thirdParty: all.filter((s) => !isApp(s)).map(([name]) => name) };
+  return { appServices: all.filter(isApp), thirdPartyServices: all.filter((s) => !isApp(s)) };
 }
 
 const isNoneTest = (t) => (Array.isArray(t) ? String(t[0]).toUpperCase() === "NONE" : typeof t === "string" && t.trim().toUpperCase() === "NONE");
@@ -579,22 +579,23 @@ export const RULES = [
   {
     id: "C5",
     title: "Кожну змінну оточення з compose застосунок справді читає",
-    hint: "Назва змінної в environment: має збігатися з тією, яку читає код (env.NAME у app/src або app/bin, зазвичай app/src/config.js) — інакше значення мовчки ігнорується і працює дефолт (так у v1.8.0 DB_POOL_SIZE дав пул 4 замість 20). Перейменовуєте змінну — міняйте разом compose і config.js. Змінні рантайму Node (TZ, NODE_OPTIONS) дозволено. Сервіси зі стороннім образом (без build: і не з образом застосунку, напр. postgres) не перевіряються.",
+    hint: "Назва змінної в environment: має збігатися з тією, яку читає код (env.NAME в app/src або app/bin) — інакше значення мовчки ігнорується і працює дефолт. Змінні рантайму Node (TZ, NODE_OPTIONS) і сервіси зі стороннім образом не перевіряються.",
     check({ compose, root }) {
       const problem = composeProblem(compose);
       if (problem) return problem;
       const reads = appEnvReads(root);
       if (!reads) return skip(`немає коду застосунку в ${APP_SOURCE_DIRS.join(", ")} — нема з чим звіряти`);
-      const { app, thirdParty } = splitAppServices(services(compose));
+      const { appServices, thirdPartyServices } = splitAppServices(services(compose));
       const problems = [];
-      const keys = app.flatMap(([name, svc]) => envEntries(svc?.environment).map(([key]) => [name, key]));
+      const keys = appServices.flatMap(([name, svc]) => envEntries(svc?.environment).map(([key]) => [name, key]));
       for (const [name, key] of keys) {
         if (!reads.has(key) && !RUNTIME_ENV.has(key)) problems.push(`${name}: ${key}`);
       }
       if (problems.length) return fail(`застосунок не читає (значення мовчки ігнорується): ${problems.join("; ")}`);
       const unique = new Set(keys.map(([, key]) => key)).size;
-      const others = thirdParty.length ? `; сторонні образи не перевірялись: ${thirdParty.join(", ")}` : "";
-      return pass(`записів environment: ${keys.length} у сервісах ${app.map(([n]) => n).join(", ")} (унікальних назв: ${unique})${others}`);
+      const names = (list) => list.map(([name]) => name).join(", ");
+      const others = thirdPartyServices.length ? `; сторонні образи не перевірялись: ${names(thirdPartyServices)}` : "";
+      return pass(`записів environment: ${keys.length} у сервісах ${names(appServices)} (унікальних назв: ${unique})${others}`);
     },
   },
   {

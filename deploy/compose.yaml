@@ -22,24 +22,31 @@ x-env: &env
   LOG_LEVEL: "info"
   DB_POOL_MAX: "20"
   DB_POOL_WAIT_MS: "2000"
-  SMS_RATE_PER_SEC: "20"
+  # Ліміт облікового запису провайдера — 10 SMS/с (materials/vendors/sms-provider.md:16-17);
+  # 5 — запас удвічі, як пропонує ADR-0001, «Що треба зробити» (docs/adr/0001-notifications.md).
+  SMS_RATE_PER_SEC: "5"
   DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set (PostgreSQL connection string)}
   SMS_TOKEN: ${SMS_TOKEN:?SMS_TOKEN must be set (SMS gateway API token)}
   SMS_BASE_URL: ${SMS_BASE_URL:?SMS_BASE_URL must be set}
   COURIER_BASE_URL: ${COURIER_BASE_URL:?COURIER_BASE_URL must be set}
 
 x-svc: &svc
+  # IMAGE — щоб той самий файл працював і локально (poshtomat, зібраний тут), і на проді
+  # (ghcr.io/<org>/<repo>, куди пушить pipeline/deploy.yml).
   image: ${IMAGE:-poshtomat}:${IMAGE_TAG:?IMAGE_TAG must be set — never deploy :latest}
   # Paths are relative to this file: context = app/, Dockerfile = deploy/Dockerfile.
   build:
     context: ../app
     dockerfile: ../deploy/Dockerfile
   restart: unless-stopped
+  # Ротація логів: без неї json-file росте без меж і забиває диск єдиної VM.
   logging:
     driver: json-file
     options:
       max-size: "20m"
       max-file: "5"
+  # Ліміти, щоб один сервіс (напр. worker у циклі повторів) не забрав усю VM у PostgreSQL,
+  # який працює на тій самій VM поза compose.
   deploy:
     resources:
       limits:
@@ -50,16 +57,13 @@ services:
   api:
     <<: *svc
     ports:
-      - "127.0.0.1:8080:8080"   # loopback only; reverse proxy listens on :443
+      # Лише loopback: 8080 без TLS не відкриваємо в мережу; назовні — через reverse proxy з TLS на VM
+      # (припущення: у materials/ вхід не описано; без проксі тут має бути "8080:8080").
+      - "127.0.0.1:8080:8080"
     environment:
       <<: *env
       PORT: "8080"
-    healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
-      interval: 30s
-      timeout: 5s
-      start_period: 15s
-      retries: 3
+    # healthcheck — з HEALTHCHECK образу (deploy/Dockerfile), тут не дублюємо.
 
   worker:
     <<: *svc
