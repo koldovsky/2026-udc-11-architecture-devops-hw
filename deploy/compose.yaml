@@ -1,35 +1,55 @@
 # Поштомат громади — продакшн на одній VM (docker compose up -d).
 # PostgreSQL працює на самій VM, поза compose.
+#
+# Секрети зберігаються у .env поруч з цим файлом — НЕ в git.
+# Обов'язкові змінні в .env:
+#   IMAGE           — повний шлях до образу, напр. ghcr.io/your-org/poshtomat
+#   DATABASE_URL    — рядок підключення до PostgreSQL з паролем
+#   SMS_BASE_URL    — базовий URL SMS-шлюзу
+#   SMS_TOKEN       — API-токен SMS-шлюзу
+#   COURIER_BASE_URL— URL сервісу кур'єрів
+#
+# Запуск: IMAGE_TAG=sha-<commit> docker compose up -d
+
+x-env: &env
+  TZ: "Europe/Kyiv"
+  LOG_LEVEL: "info"
+  DB_POOL_MAX: "20"
+  DB_POOL_WAIT_MS: "2000"
+  SMS_RATE_PER_SEC: "20"
+
+x-svc: &svc
+  image: ${IMAGE}:${IMAGE_TAG:?IMAGE_TAG must be set — never deploy :latest}
+  env_file: .env
+  restart: unless-stopped
+  logging:
+    driver: json-file
+    options:
+      max-size: "20m"
+      max-file: "5"
+  deploy:
+    resources:
+      limits:
+        cpus: "1"
+        memory: 256M
+
 services:
   api:
-    image: poshtomat:latest
-    build:
-      context: ../app
-      dockerfile: ../deploy/Dockerfile
+    <<: *svc
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"   # loopback only; reverse proxy listens on :443
     environment:
-      TZ: "Europe/Kyiv"
+      <<: *env
       PORT: "8080"
-      LOG_LEVEL: "info"
-      DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
-      DB_POOL_MAX: "20"
-      DB_POOL_WAIT_MS: "2000"
-      SMS_BASE_URL: "https://sms.example.net/api/v2"
-      SMS_TOKEN: "CHANGE_ME"
-      SMS_RATE_PER_SEC: "20"
-      COURIER_BASE_URL: "https://courier.example.com/api/v1"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
 
   worker:
-    image: poshtomat:latest
+    <<: *svc
     command: ["node", "src/worker.js"]
     environment:
-      TZ: "Europe/Kyiv"
-      LOG_LEVEL: "info"
-      DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
-      DB_POOL_MAX: "20"
-      DB_POOL_WAIT_MS: "2000"
-      SMS_BASE_URL: "https://sms.example.net/api/v2"
-      SMS_TOKEN: "CHANGE_ME"
-      SMS_RATE_PER_SEC: "20"
-      COURIER_BASE_URL: "https://courier.example.com/api/v1"
+      <<: *env
