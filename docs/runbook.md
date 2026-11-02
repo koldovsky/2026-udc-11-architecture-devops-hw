@@ -1,8 +1,9 @@
 # Runbook: API повільний або віддає 5xx (`ApiLatencyP95High`, `Api5xxRateHigh`)
 
 > Для чергового, якого розбудили і який інциденту 2026-10-14 не бачив. Усі команди
-> виконуються на VM: `ssh poshtomat-prod-1`, далі `cd /opt/poshtomat` (тека з
-> `deploy/compose.yaml`). Час — Europe/Kyiv.
+> виконуються на VM: `ssh poshtomat-prod-1`, далі `cd /opt/poshtomat`. Там лежать
+> `compose.yaml` (його кладе pipeline з `deploy/compose.yaml`) і `.env` з `IMAGE`,
+> `PREVIOUS_IMAGE` і `SMS_TOKEN`, тож `docker compose` без `-f` бере саме їх. Час — Europe/Kyiv.
 
 - **Алерти:**
   - `ApiLatencyP95High` (page): `p95_ms > 2000` протягом 3 хв;
@@ -17,12 +18,12 @@
 1. **Чи був деплой за останню годину?** Якщо так, і алерт прийшов після нього, **спершу відкат** (розділ «Що робити», рядок 1), розслідування потім. На 14.10 це скоротило б інцидент з 45 до ~10 хв.
    ```bash
    # + останні записи історії деплоїв VM (формат — як incident/deploys.log)
-   docker compose -f deploy/compose.yaml ps    # колонка IMAGE: яка версія зараз
+   docker compose ps    # колонка IMAGE: яка версія зараз
    ```
 2. Напишіть у `#poshtomat-oncall`: «Беру ApiLatencyP95High/Api5xxRateHigh, дивлюсь». Попередьте гарячу лінію, якщо робочий час.
 3. Подивіться, **яку саме** помилку віддає API (команда нижче). Відповідь визначає гілку діагностики.
    ```bash
-   docker compose -f deploy/compose.yaml logs --since 15m api \
+   docker compose logs --since 15m api \
      | grep '"level":"error"' | grep -o '"error":"[^"]*"' | sort | uniq -c | sort -rn
    ```
    - `db pool wait timeout after …ms` — пул БД вичерпано, далі «Діагностика», рядки 1–3;
@@ -34,10 +35,10 @@
 | Питання | Команда | Як читати результат |
 |---|---|---|
 | 1. Пул БД вичерпано? | дашборд моніторингу: метрики `db_pool_in_use` і `db_pool_waiting` за останні 30 хв (окремого ендпойнта метрик у застосунку немає) | Норма в пік: `in_use` 11–13, `waiting` 0. **`in_use` стоїть рівно на одному числі, а `waiting` > 0** — запитам не вистачає з'єднань |
-| 2. Який розмір пулу насправді отримав застосунок? | `docker compose -f deploy/compose.yaml exec api node -e 'import("./src/config.js").then(m => console.log(m.loadConfig().dbPoolMax))'` | Має бути `20`. **`4`** — це значення за замовчуванням: змінна з compose не дійшла до застосунку |
-| 3. Чи збігаються назви змінних compose з тими, що читає код? | `node tools/check-deploy.mjs \| grep '^E1'` (з копії репо на поточному коміті) або `docker compose -f deploy/compose.yaml exec api env \| grep -E '^(DB_\|SMS_\|COURIER_)'` порівняти з `grep -o 'env\.[A-Z_]*' app/src/config.js` | `E1 FAIL … DB_POOL_SIZE` або назва в `env`, якої немає в `config.js`: перейменування чи опечатка в конфігу |
+| 2. Який розмір пулу насправді отримав застосунок? | `docker compose exec api node -e 'import("./src/config.js").then(m => console.log(m.loadConfig().dbPoolMax))'` | Має бути `20`. **`4`** — це значення за замовчуванням: змінна з compose не дійшла до застосунку |
+| 3. Чи збігаються назви змінних compose з тими, що читає код? | `node tools/check-deploy.mjs \| grep '^E1'` (з копії репо на поточному коміті) або `docker compose exec api env \| grep -E '^(DB_\|SMS_\|COURIER_)'` порівняти з `grep -o 'env\.[A-Z_]*' app/src/config.js` | `E1 FAIL … DB_POOL_SIZE` або назва в `env`, якої немає в `config.js`: перейменування чи опечатка в конфігу |
 | 4. Чи жива сама БД? | `pg_isready -h 192.0.2.10 -p 5432` і `sudo -u postgres psql -c 'select count(*) from pg_stat_activity'` | `accepting connections` і кількість з'єднань у межах норми → БД ні до чого, проблема в пулі застосунку. Між **02:00 і 02:30** БД на запис заблокована бекапом (`docs/ops/backup-runbook.md`): помилки на `POST` у цей час — очікувані |
-| 5. Чи це навантаження, а не поломка? | дашборд, `rps`, або `docker compose … logs --since 15m api \| grep -c '"msg":"request"'` × 100 | `rps` 11–13 у пік — **нормально** (так щодня 13:30–14:50). Різке зростання в кілька разів → можливо, сканер служби доставки повторює запити |
+| 5. Чи це навантаження, а не поломка? | дашборд, `rps`, або `docker compose logs --since 15m api \| grep -c '"msg":"request"'` × 100 | `rps` 11–13 у пік — **нормально** (так щодня 13:30–14:50). Різке зростання в кілька разів → можливо, сканер служби доставки повторює запити |
 
 **Що НЕ є причиною пейджу, хоча кидається в очі:**
 - `SmsProvider429RateHigh` і `sms provider rate limited` у логах worker-а: це **щоденний** післяобідній фон із ~13:30, бо worker шле швидше за ліміт провайдера. Worker працює з окремим пулом і на API не впливає.
@@ -56,9 +57,9 @@
 
 | Ситуація | Дія | Команда | Ризик / що перевірити після |
 |---|---|---|---|
-| Пейдж прийшов протягом ~1 год після деплою | Відкат на попередній тег | `IMAGE_TAG=<попередня версія з історії деплоїв> SMS_TOKEN=… docker compose -f deploy/compose.yaml up -d api worker` | Перевірте, що в релізі не було міграції БД. Після: p95 < 500 мс за 2–3 хв (розділ нижче) |
-| Пул менший, ніж має бути (рядок 2), деплою не було | Виправити назву/значення змінної в compose і перезапустити api | `docker compose -f deploy/compose.yaml up -d api` | Простий **перезапуск без зміни конфігу не допоможе**: на 14.10 він повторно застосував ту саму помилку. Після: рядок 2 показує `20` |
-| Пул 20, `rps` у кілька разів вищий за норму | Зменшити навантаження: знайти джерело повторів | `docker compose … logs --since 15m api \| grep -o '"path":"[^"]*"' \| sort \| uniq -c` | Не збільшуйте пул понад `max_connections` Postgres мінус з'єднання worker-а і бекапу |
+| Пейдж прийшов протягом ~1 год після деплою | Відкат на попередній тег | `grep '^PREVIOUS_IMAGE=' .env` (попередній образ записує pipeline), потім `sed -i "s#^IMAGE=.*#IMAGE=$(grep '^PREVIOUS_IMAGE=' .env \| cut -d= -f2-)#" .env && docker compose up -d --wait api worker` | Секрети не передавайте в командному рядку: `SMS_TOKEN` compose бере з `.env`. Перевірте, що в релізі не було міграції БД. Наступний деплой з `main` поверне новий образ — спершу виправте причину. Після: p95 < 500 мс за 2–3 хв (розділ нижче) Після: p95 < 500 мс за 2–3 хв (розділ нижче) |
+| Пул менший, ніж має бути (рядок 2), деплою не було | Виправити назву/значення змінної в compose і перезапустити api | `docker compose up -d api` | Простий **перезапуск без зміни конфігу не допоможе**: на 14.10 він повторно застосував ту саму помилку. Після: рядок 2 показує `20` |
+| Пул 20, `rps` у кілька разів вищий за норму | Зменшити навантаження: знайти джерело повторів | `docker compose logs --since 15m api \| grep -o '"path":"[^"]*"' \| sort \| uniq -c` | Не збільшуйте пул понад `max_connections` Postgres мінус з'єднання worker-а і бекапу |
 | Помилки лише на запис між 02:00 і 02:30 | Нічого: це вікно бекапу | — | Після 02:30 помилки мають зникнути самі. Якщо ні, див. `docs/ops/backup-runbook.md` |
 
 ## Коли ескалювати і кого кликати
@@ -72,7 +73,7 @@
 
 - `p95_ms` < 500 і `error_rate` < 0.01 протягом **5 хв поспіль**. На 14.10 після відкату p95 впав до ~300 мс за 1–2 хв.
 - `db_pool_waiting` = 0, `db_pool_in_use` нижче розміру пулу.
-- `docker compose … logs --since 5m api | grep -c 'db pool wait timeout'` → `0`.
+- `docker compose logs --since 5m api | grep -c 'db pool wait timeout'` → `0`.
 - Пейджі `ApiLatencyP95High` і `Api5xxRateHigh` закрились самі.
 - Перевірте видачу як мешканець: `curl -s -XPOST localhost:8080/pickup -d '{"code":"000000"}'` → `404 unknown or already used code` (а не 503).
 - Запишіть у `#poshtomat-oncall`, що зроблено і о котрій, і заведіть post-mortem, якщо був пейдж.

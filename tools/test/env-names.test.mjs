@@ -40,6 +40,20 @@ test("E1: appEnvNames finds env.NAME and env[\"NAME\"]", () => {
   assert.deepEqual([...appEnvNames(CONFIG)].sort(), ["DB_POOL_MAX", "DB_POOL_WAIT_MS", "PORT", "SMS_TOKEN"]);
 });
 
+test("E1: env.NAME in a comment or a string literal is not a read", () => {
+  const source = [
+    "// renamed: env.DB_POOL_SIZE is gone, read DB_POOL_MAX",
+    "/* env.LEGACY_POOL */",
+    'const hint = "set env.DB_POOL_SIZE"; const url = "http://localhost"; // env.OTHER',
+    "const max = Number(env.DB_POOL_MAX) || 4;",
+    'const token = env["SMS_TOKEN"] || "";',
+  ].join("\n");
+  assert.deepEqual([...appEnvNames(source)].sort(), ["DB_POOL_MAX", "SMS_TOKEN"]);
+  withRepo(source, (root) => {
+    assert.equal(check(root, { DB_POOL_SIZE: "20" }).status, "FAIL");
+  });
+});
+
 test("E1: the v1.8.0 incident — DB_POOL_SIZE in compose, DB_POOL_MAX in config — FAILS", () => {
   withRepo(CONFIG, (root) => {
     const r = check(root, { PORT: "8080", DB_POOL_SIZE: "20", DB_POOL_WAIT_MS: "2000" });

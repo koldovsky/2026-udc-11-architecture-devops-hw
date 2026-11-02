@@ -378,14 +378,26 @@ const healthcheckOff = (hc) => hc?.disable === true || isNoneTest(hc?.test);
 export const APP_CONFIG = "app/src/config.js";
 const RUNTIME_ENV = new Set(["TZ", "NODE_ENV", "NODE_OPTIONS", "NODE_EXTRA_CA_CERTS"]);
 
-/** Names the app reads: `env.NAME` and `env["NAME"]` (process.env.NAME included). */
+/**
+ * Names the app reads: `env.NAME` and `env["NAME"]` (process.env.NAME included).
+ * Comments and string literals are blanked out first, so `// env.OLD_NAME` or
+ * "env.OLD_NAME" in a message does not count as reading OLD_NAME; the one
+ * literal kept is the key of `env["NAME"]`.
+ */
 export function appEnvNames(source) {
+  const code = String(source).replace(
+    /\/\*[\s\S]*?\*\/|\/\/[^\n]*|(\benv\[\s*)?(["'`])((?:\\.|(?!\2)[^\\])*)\2/g,
+    (whole, envIndex, quote, body) => (envIndex !== undefined ? whole : blank(whole)),
+  );
   const names = new Set();
-  for (const m of String(source).matchAll(/\benv(?:\.([A-Za-z_][A-Za-z0-9_]*)|\[\s*["']([A-Za-z_][A-Za-z0-9_]*)["']\s*\])/g)) {
+  for (const m of code.matchAll(/\benv(?:\.([A-Za-z_][A-Za-z0-9_]*)|\[\s*["']([A-Za-z_][A-Za-z0-9_]*)["']\s*\])/g)) {
     names.add(m[1] ?? m[2]);
   }
   return names;
 }
+
+// keep line breaks so nothing else shifts; drop everything else
+const blank = (text) => text.replace(/[^\n]/g, " ");
 
 function oneShot(svc) {
   if (asList(svc?.ports).length) return false;
