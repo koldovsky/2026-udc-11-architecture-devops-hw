@@ -11,6 +11,7 @@ import { fileURLToPath } from "node:url";
 import {
   classifyYamlFailure,
   dockerfileSource,
+  envNamesRead,
   formatReport,
   isSecretLike,
   isSecretReference,
@@ -133,6 +134,93 @@ test("C4: secret-like compose variables come only by reference", () => {
   assert.equal(status("C4", ctx({ compose: compose(svc({ environment: ["API_TOKEN=CHANGE_ME"] })) })), "FAIL");
   assert.equal(status("C4", ctx({ compose: compose(svc({ environment: { API_TOKEN: "${API_TOKEN:-CHANGE_ME}" } })) })), "FAIL");
   assert.equal(status("C4", ctx({ compose: compose(svc({ environment: { PGPASSWORD: "CHANGE_ME" } })) })), "FAIL");
+});
+
+// C5 is the rule that came out of the 2026-10-14 incident: v1.8.0 renamed DB_POOL_MAX
+// to DB_POOL_SIZE in compose only, app/src/config.js kept reading DB_POOL_MAX, and the
+// pool silently fell from 20 to the `|| 4` default. The rule reads the real config.js
+// from ctx.root, so these tests write one into a temp tree.
+const CONFIG_JS = `// Runtime configuration.
+export function loadConfig(env = process.env) {
+  return {
+    dbUrl: env.DATABASE_URL || "postgres://poshtomat@localhost:5432/poshtomat",
+    // sensible default for local dev
+    dbPoolMax: Number(env.DB_POOL_MAX) || 4,
+    smsToken: env.SMS_TOKEN || "",
+  };
+}
+`;
+
+test("C5: compose environment keys are exactly what app/src/config.js reads", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "check-deploy-c5-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  mkdirSync(join(dir, "app", "src"), { recursive: true });
+  const configFile = join(dir, "app", "src", "config.js");
+  writeFileSync(configFile, CONFIG_JS);
+  const at = (...list) => ({ ...ctx({ compose: compose(...list) }), root: dir });
+  const C5 = (...list) => status("C5", at(...list));
+  const message = (...list) => RULES.find((r) => r.id === "C5").check(at(...list)).message;
+
+  // the incident, reproduced: the key nobody reads and the variable nobody sets
+  const incident = svc({
+    environment: {
+      TZ: "Europe/Kyiv",
+      DATABASE_URL: "${DATABASE_URL:?missing}",
+      DB_POOL_SIZE: "20",
+      SMS_TOKEN: "${SMS_TOKEN:?missing}",
+    },
+  });
+  assert.equal(C5(incident), "FAIL");
+  assert.match(message(incident), /DB_POOL_SIZE — ніхто не читає/);
+  assert.match(message(incident), /не задано DB_POOL_MAX/);
+
+  // the same release, as it should have looked
+  const app = (extra = {}) =>
+    svc({
+      environment: {
+        TZ: "Europe/Kyiv",
+        NODE_ENV: "production",
+        DATABASE_URL: "${DATABASE_URL:?missing}",
+        DB_POOL_MAX: "20",
+        SMS_TOKEN: "${SMS_TOKEN:?missing}",
+        ...extra,
+      },
+    });
+  assert.equal(C5(app()), "PASS");
+
+  // a correct config a naive version of the rule would trip on:
+  // TZ and NODE_ENV are set but never read (the platform reads them, not the app);
+  // the values are ${VAR:?…} references, not literals — the rule looks at keys only;
+  // the environment may be a list instead of a map;
+  // and a service that runs something else entirely (PostgreSQL, a backup job) is not
+  // held to this app's config surface.
+  const asList = svc({ environment: ["TZ=Europe/Kyiv", "DATABASE_URL=${DATABASE_URL:?missing}", "DB_POOL_MAX", "SMS_TOKEN"] });
+  const foreign = svc({ image: "postgres:16.4-alpine", environment: { POSTGRES_DB: "poshtomat", POSTGRES_PASSWORD: "${PG_PASSWORD:?missing}" } });
+  assert.equal(C5(app(), asList, foreign), "PASS");
+  assert.match(message(app(), asList, foreign), /s1, s2$/); // the postgres service was left out
+
+  // drift between two services of the same image: api keeps the variable, worker loses it
+  const { DB_POOL_MAX, ...withoutPool } = app().environment;
+  assert.equal(C5(app(), svc({ environment: withoutPool })), "FAIL");
+  assert.match(message(app(), svc({ environment: withoutPool })), /s2: не задано DB_POOL_MAX/);
+
+  // a typo added next to the right key: nothing is missing, but one key is dead weight
+  assert.equal(C5(app({ DB_POOL_MAXX: "20" })), "FAIL");
+
+  // without the other side of the contract there is nothing to compare: SKIP, not FAIL
+  writeFileSync(configFile, "export const loadConfig = () => ({ port: 8080 });\n");
+  assert.equal(C5(app()), "SKIP");
+  rmSync(configFile);
+  assert.equal(C5(app()), "SKIP");
+  assert.equal(status("C5", { ...ctx({}), root: dir }), "FAIL"); // no compose at all
+});
+
+test("env.* reads: dot and bracket form, not prose, not URLs", () => {
+  assert.deepEqual([...envNamesRead('a: env.PORT, b: env["DB_POOL_MAX"], c: env[\'SMS_TOKEN\']')], ["PORT", "DB_POOL_MAX", "SMS_TOKEN"]);
+  assert.deepEqual([...envNamesRead("// renamed from env.DB_POOL_SIZE\n/* env.OLD_NAME */\nx: env.DB_POOL_MAX")], ["DB_POOL_MAX"]);
+  // a // inside a line is a URL, not a comment: the read before it still counts
+  assert.deepEqual([...envNamesRead('smsBaseUrl: env.SMS_BASE_URL || "http://localhost:9001",')], ["SMS_BASE_URL"]);
+  assert.deepEqual([...envNamesRead("export function loadConfig(env = process.env) {}")], []);
 });
 
 test("W1: the workflow exists, parses, and does not use pull_request_target", () => {
@@ -273,7 +361,7 @@ test("when npx cannot run, the YAML rules say so instead of blaming the files", 
     const results = runChecks(loadContext(dir, { parse: offline }));
     assert.equal(calls, 1, "after the first failure npx is not tried again");
     const by = Object.fromEntries(results.map((r) => [r.id, r]));
-    for (const id of ["D3", "C1", "C2", "C3", "C4", "W1"]) {
+    for (const id of ["D3", "C1", "C2", "C3", "C4", "C5", "W1"]) {
       assert.equal(by[id].status, "FAIL", id);
       assert.equal(by[id].toolError, true, id);
       assert.match(by[id].message, /не вдалося запустити npx yaml@2\.8\.1 — перший запуск потребує мережі \(npm error code ENOTCACHED\)/, id);
@@ -330,7 +418,7 @@ test("the CLI prints a row per rule, survives broken YAML and exits 1 on failure
     const rows = Object.fromEntries(out.split("\n").filter((l) => /^[DCW]\d /.test(l)).map((l) => [l.slice(0, 2), l.slice(4, 8)]));
     assert.deepEqual(rows, {
       D1: "PASS", D2: "PASS", D3: "FAIL", D4: "PASS",
-      C1: "PASS", C2: "PASS", C3: "PASS", C4: "PASS",
+      C1: "PASS", C2: "PASS", C3: "PASS", C4: "PASS", C5: "SKIP",
       W1: "FAIL", W2: "SKIP", W3: "SKIP", W4: "SKIP", W5: "SKIP",
     });
     assert.match(out, /W1 +FAIL .*не розібрався як YAML/);

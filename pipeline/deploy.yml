@@ -1,0 +1,235 @@
+# Тести → збірка образу → деплой на VM із ручним погодженням.
+#
+# УВАГА: GitHub виконує workflow лише з каталогу `.github/workflows/`.
+# Щоб цей файл запрацював, його треба покласти (або зісимлінкувати) як
+# `.github/workflows/deploy.yml`.
+#
+# Потрібні secrets (Settings → Environments → production → Secrets):
+#   DEPLOY_HOST         — хост або IP продакшн-VM
+#   DEPLOY_USER         — користувач для ssh, член групи docker
+#   DEPLOY_SSH_KEY      — приватний ключ деплою (окремий, лише для цього)
+#   DEPLOY_KNOWN_HOSTS  — рядок known_hosts VM (`ssh-keyscan <host>`)
+# Токен реєстру не потрібен: використовуємо вбудований GITHUB_TOKEN.
+#
+# Секрети самого застосунку (DATABASE_URL, SMS_TOKEN) у CI не потрапляють
+# взагалі — вони лежать у `.env` на VM, який оператор заводить один раз.
+# Workflow переписує в ньому тільки рядок IMAGE.
+
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Жодних прав за замовчуванням: кожна job просить лише те, що їй потрібно.
+permissions: {}
+
+# Два релізи одночасно розійшлися б у стані VM; погодження в черзі не скасовуємо.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  test:
+    name: tests
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+
+      # Залежностей і lockfile у сервісі немає, тому `npm ci` тут не потрібен
+      # (і впав би). `npm test` — це `node --test`.
+      - run: npm test
+        working-directory: app
+
+  build:
+    name: image
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write # push у GHCR — більше нічого цій job не треба
+    outputs:
+      image: ${{ steps.release.outputs.image }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      # GHCR приймає лише нижній регістр, а github.repository може містити
+      # великі літери.
+      - id: name
+        env:
+          REPO: ${{ github.repository }}
+        run: echo "ref=${REGISTRY}/${REPO,,}" >> "$GITHUB_OUTPUT"
+
+      # Потрібен buildx-білдер на docker-container driver: типовий docker
+      # driver не вміє ні cache type=gha, ні експорту sbom/provenance нижче.
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.name.outputs.ref }}
+          tags: |
+            type=sha,format=long
+            type=raw,value=latest,enable={{is_default_branch}}
+
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: app
+          file: deploy/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      # Деплой іде за digest, а не за тегом: тег можна перезаписати, digest — ні.
+      - id: release
+        env:
+          IMAGE_REF: ${{ steps.name.outputs.ref }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: echo "image=${IMAGE_REF}@${DIGEST}" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    name: production
+    needs: build
+    runs-on: ubuntu-latest
+    # Ручне погодження: GitHub тримає job у стані "Waiting", поки required
+    # reviewers цього environment не натиснуть Approve. Налаштовується
+    # в Settings → Environments → production → Required reviewers.
+    environment:
+      name: production
+      url: https://poshtomat.example.org
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Authorise ssh
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d "$RUNNER_TEMP/ssh"
+          umask 077
+          printf '%s\n' "$SSH_KEY" > "$RUNNER_TEMP/ssh/id"
+          printf '%s\n' "$KNOWN_HOSTS" > "$RUNNER_TEMP/ssh/known_hosts"
+          # Ключ хоста закріплений: StrictHostKeyChecking=no зробив би деплой
+          # відкритим до MITM у мережі між раннером і VM.
+          cat > "$RUNNER_TEMP/ssh/config" <<'CONF'
+          Host *
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            BatchMode yes
+            ConnectTimeout 15
+          CONF
+
+      - name: Ship compose.yaml
+        env:
+          SSH_HOST: ${{ secrets.DEPLOY_HOST }}
+          SSH_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_DIR: ${{ vars.DEPLOY_DIR || '/opt/poshtomat' }}
+        run: |
+          set -euo pipefail
+          scp -F "$RUNNER_TEMP/ssh/config" \
+              -i "$RUNNER_TEMP/ssh/id" \
+              -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" \
+              deploy/compose.yaml \
+              "$SSH_USER@$SSH_HOST:$DEPLOY_DIR/compose.yaml"
+
+      - name: Release
+        env:
+          IMAGE: ${{ needs.build.outputs.image }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SSH_HOST: ${{ secrets.DEPLOY_HOST }}
+          SSH_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_DIR: ${{ vars.DEPLOY_DIR || '/opt/poshtomat' }}
+        run: |
+          set -euo pipefail
+
+          # Значення йдуть у stdin, а не в argv: у `ps` на VM токен не видно.
+          {
+            printf 'IMAGE=%q\n'          "$IMAGE"
+            printf 'REGISTRY=%q\n'       "$REGISTRY"
+            printf 'REGISTRY_USER=%q\n'  "$REGISTRY_USER"
+            printf 'REGISTRY_TOKEN=%q\n' "$REGISTRY_TOKEN"
+            printf 'DEPLOY_DIR=%q\n'     "$DEPLOY_DIR"
+            cat <<'REMOTE'
+          set -euo pipefail
+
+          cd "$DEPLOY_DIR"
+          ENV_FILE="$DEPLOY_DIR/.env"
+          test -f "$ENV_FILE" || { echo "no $ENV_FILE on the host; provision it first" >&2; exit 1; }
+
+          # Тягнемо образ і одразу розлогінюємось, щоб на VM не залишався
+          # креденшл реєстру.
+          printf '%s' "$REGISTRY_TOKEN" |
+            docker login "$REGISTRY" -u "$REGISTRY_USER" --password-stdin
+          trap 'docker logout "$REGISTRY" >/dev/null 2>&1 || true' EXIT
+          docker pull "$IMAGE"
+
+          PREVIOUS="$(sed -n 's/^IMAGE=//p' "$ENV_FILE" | tail -1 || true)"
+          echo "current: ${PREVIOUS:-<none>}"
+          echo "new:     $IMAGE"
+
+          # Переписуємо тільки рядок IMAGE, решту .env (секрети) не чіпаємо.
+          # Через mktemp поряд із файлом, щоб mv був атомарним і права збереглись.
+          write_image() {
+            tmp="$(mktemp "$ENV_FILE.XXXXXX")"
+            chmod --reference="$ENV_FILE" "$tmp" 2>/dev/null || chmod 600 "$tmp"
+            { grep -v '^IMAGE=' "$ENV_FILE" || true; echo "IMAGE=$1"; } > "$tmp"
+            mv "$tmp" "$ENV_FILE"
+          }
+
+          write_image "$IMAGE"
+
+          # --wait: compose сам чекає, поки api стане healthy за GET /health.
+          if docker compose up -d --remove-orphans --wait --wait-timeout 120; then
+            curl -fsS --max-time 10 http://127.0.0.1:8080/health
+            echo
+            echo "deployed $IMAGE"
+            docker image prune -f --filter 'until=168h' >/dev/null || true
+            exit 0
+          fi
+
+          echo "::error::rollout failed, rolling back" >&2
+          docker compose logs --no-color --tail 50 api worker || true
+          if [ -n "$PREVIOUS" ]; then
+            write_image "$PREVIOUS"
+            docker compose up -d --remove-orphans --wait --wait-timeout 120 ||
+              echo "rollback to $PREVIOUS also failed; the host needs a human" >&2
+          else
+            echo "no previous IMAGE recorded; nothing to roll back to" >&2
+          fi
+          exit 1
+          REMOTE
+          } | ssh -F "$RUNNER_TEMP/ssh/config" \
+                  -i "$RUNNER_TEMP/ssh/id" \
+                  -o UserKnownHostsFile="$RUNNER_TEMP/ssh/known_hosts" \
+                  "$SSH_USER@$SSH_HOST" bash -s

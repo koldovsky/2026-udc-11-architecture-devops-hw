@@ -261,6 +261,30 @@ function isComposeReference(value) {
   return /^\$\{[A-Za-z_][A-Za-z0-9_]*(:?\?[^}]*)?\}$/.test(value) || /^\$[A-Za-z_][A-Za-z0-9_]*$/.test(value);
 }
 
+// --- C5: the contract between compose and the code that reads the environment
+export const CONFIG_SOURCE = "app/src/config.js";
+
+// Variables the platform consumes, not the application: legitimately set in compose
+// although `config.js` never reads them. TZ is read by Node/libc for local time,
+// NODE_ENV by the Node ecosystem itself.
+export const PLATFORM_ENV = new Set(["TZ", "NODE_ENV"]);
+
+const ENV_READ = /\benv(?:\.([A-Za-z_][A-Za-z0-9_]*)|\[\s*["'`]([A-Za-z_][A-Za-z0-9_]*)["'`]\s*\])/g;
+
+/**
+ * Environment variables a source file reads: `env.NAME`, `env["NAME"]`.
+ * Whole-line comments are dropped first (a name named only in prose is not a read);
+ * `//` inside a line is left alone, it is usually a URL.
+ */
+export function envNamesRead(text) {
+  const code = String(text)
+    .replace(/\/\*[\s\S]*?\*\//g, "")
+    .split(/\r?\n/)
+    .filter((line) => !/^\s*(\/\/|\*)/.test(line))
+    .join("\n");
+  return new Set([...code.matchAll(ENV_READ)].map((m) => m[1] ?? m[2]));
+}
+
 function workflowJobs(workflow) {
   const jobs = workflow.data?.jobs;
   return jobs && typeof jobs === "object" && !Array.isArray(jobs) ? jobs : null;
@@ -530,6 +554,41 @@ export const RULES = [
         }
       }
       return problems.length ? fail(problems.join("; ")) : pass("секретоподібні змінні задано посиланнями");
+    },
+  },
+  {
+    // Урок інциденту 2026-10-14 (docs/rca.md, action item #1 у docs/postmortem.md):
+    // реліз перейменував DB_POOL_MAX → DB_POOL_SIZE лише в compose, код читав старе
+    // ім'я — пул тихо впав 20 → 4. Жоден із двох файлів окремо не був неправильним,
+    // тому цього не побачили ні в дифі, ні в зелених тестах. Правило тримає сам
+    // контракт: множина ключів environment сервісу = множина env.* у config.js.
+    id: "C5",
+    title: `Ключі environment сервісів застосунку збігаються з env.* у ${CONFIG_SOURCE}`,
+    hint: `Кожен ключ environment у ${PATHS.compose} має читатися в ${CONFIG_SOURCE} як env.<KEY>, і кожна змінна, яку читає ${CONFIG_SOURCE}, має бути задана в кожному сервісі застосунку — інакше вона тихо візьме дефолт із коду. Перейменували змінну — перейменуйте на обох боках. Змінні, які споживає не застосунок, а платформа (${[...PLATFORM_ENV].join(", ")}), правило не вимагає і не забороняє; сервіс, що не задає жодної змінної застосунку (БД, кеш, бекап), правило не чіпає.`,
+    check(ctx) {
+      const problem = composeProblem(ctx.compose);
+      if (problem) return problem;
+      const configPath = join(ctx.root, CONFIG_SOURCE);
+      if (!existsSync(configPath)) return skip(`${CONFIG_SOURCE} не знайдено`);
+      const read = envNamesRead(readFileSync(configPath, "utf8"));
+      if (!read.size) return skip(`у ${CONFIG_SOURCE} немає читань env.*`);
+      const problems = [];
+      const checked = [];
+      for (const [name, svc] of services(ctx.compose)) {
+        const keys = envEntries(svc?.environment).map(([key]) => key);
+        // Сервіс належить застосунку, якщо задає хоч одну змінну, яку той читає:
+        // PostgreSQL чи бекап зі своїм POSTGRES_PASSWORD сюда не потрапляє.
+        if (!keys.some((key) => read.has(key))) continue;
+        checked.push(name);
+        const unread = keys.filter((key) => !read.has(key) && !PLATFORM_ENV.has(key));
+        const missing = [...read].filter((key) => !keys.includes(key));
+        if (unread.length) problems.push(`${name}: ${unread.join(", ")} — ніхто не читає в ${CONFIG_SOURCE}`);
+        if (missing.length) problems.push(`${name}: не задано ${missing.join(", ")} — застосунок візьме тихий дефолт з коду`);
+      }
+      if (!checked.length) return skip(`жоден сервіс не задає змінних, які читає ${CONFIG_SOURCE}`);
+      return problems.length
+        ? fail(problems.join("; "))
+        : pass(`${read.size} змінних, той самий набір у кожного сервісу застосунку: ${checked.join(", ")}`);
     },
   },
   {
