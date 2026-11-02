@@ -158,7 +158,12 @@ jobs:
           # для відкату (docs/runbook.md). prune нижче прибирає лише образи без тегу.
           prev="$(grep '^IMAGE=' .env | cut -d= -f2- || true)"
           grep -vE '^(IMAGE|PREVIOUS_IMAGE)=' .env > .env.new || true
-          if [ -n "$prev" ]; then echo "PREVIOUS_IMAGE=${prev}" >> .env.new; fi
+          # той самий образ ще раз — PREVIOUS_IMAGE не чіпаємо, інакше відкату нікуди
+          if [ -n "$prev" ] && [ "$prev" != "$image" ]; then
+            echo "PREVIOUS_IMAGE=${prev}" >> .env.new
+          else
+            grep '^PREVIOUS_IMAGE=' .env >> .env.new || true
+          fi
           echo "IMAGE=${image}" >> .env.new
           chmod 600 .env.new
           mv .env.new .env
