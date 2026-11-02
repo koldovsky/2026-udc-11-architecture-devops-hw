@@ -1,35 +1,64 @@
 # Поштомат громади — продакшн на одній VM (docker compose up -d).
 # PostgreSQL працює на самій VM, поза compose.
+#
+# Обов'язкові змінні (compose падає, якщо їх нема) беруться з файлу .env поруч
+# із цим compose.yaml НА VM (chmod 600), а не з репозиторію:
+#   IMAGE=ghcr.io/<owner>/<repo>:<tag>   # виставляє pipeline під час деплою
+#   SMS_TOKEN=...                        # секрет SMS-провайдера
+
+x-common-env: &common-env
+  TZ: "Europe/Kyiv"
+  LOG_LEVEL: "info"
+  DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
+  DB_POOL_MAX: "20"
+  DB_POOL_WAIT_MS: "2000"
+  SMS_BASE_URL: "https://sms.example.net/api/v2"
+  SMS_TOKEN: "${SMS_TOKEN:?SMS_TOKEN must be set in .env}"
+  SMS_RATE_PER_SEC: "20"
+  COURIER_BASE_URL: "https://courier.example.com/api/v1"
+
+x-hardening: &hardening
+  image: ${IMAGE:?IMAGE must be set (registry image with a pinned tag)}
+  restart: unless-stopped
+  init: true
+  read_only: true
+  tmpfs:
+    - /tmp
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 200
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+
 services:
   api:
-    image: poshtomat:latest
+    <<: *hardening
     build:
       context: ../app
       dockerfile: ../deploy/Dockerfile
     ports:
       - "8080:8080"
     environment:
-      TZ: "Europe/Kyiv"
+      <<: *common-env
       PORT: "8080"
-      LOG_LEVEL: "info"
-      DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
-      DB_POOL_MAX: "20"
-      DB_POOL_WAIT_MS: "2000"
-      SMS_BASE_URL: "https://sms.example.net/api/v2"
-      SMS_TOKEN: "CHANGE_ME"
-      SMS_RATE_PER_SEC: "20"
-      COURIER_BASE_URL: "https://courier.example.com/api/v1"
+    mem_limit: 512m
+    cpus: 1.0
+    # HEALTHCHECK береться з образу (GET /health).
+    stop_grace_period: 15s
 
   worker:
-    image: poshtomat:latest
+    <<: *hardening
     command: ["node", "src/worker.js"]
     environment:
-      TZ: "Europe/Kyiv"
-      LOG_LEVEL: "info"
-      DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
-      DB_POOL_MAX: "20"
-      DB_POOL_WAIT_MS: "2000"
-      SMS_BASE_URL: "https://sms.example.net/api/v2"
-      SMS_TOKEN: "CHANGE_ME"
-      SMS_RATE_PER_SEC: "20"
-      COURIER_BASE_URL: "https://courier.example.com/api/v1"
+      <<: *common-env
+    mem_limit: 256m
+    cpus: 0.5
+    # Worker не слухає порт — healthcheck із образу тут не застосовний.
+    healthcheck:
+      disable: true
+    stop_grace_period: 15s
