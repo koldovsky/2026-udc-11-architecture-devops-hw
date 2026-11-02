@@ -108,7 +108,7 @@ jobs:
           target: /opt/poshtomat
           strip_components: 1
 
-      # Pull the new image and perform a zero-downtime restart.
+      # Pull the new image and recreate containers (short downtime while compose recreates them).
       # GHCR_TOKEN is a PAT with packages:read scope, stored in repo secrets.
       # It is passed to the remote shell as an env var (never as a CLI arg)
       # so it does not appear in the remote process list or shell history.
