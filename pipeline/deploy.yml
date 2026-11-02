@@ -42,8 +42,27 @@ jobs:
         working-directory: app
         run: npm test
 
+  # Post-mortem 2026-10-14, action item #2: детерміновані перевірки деплою — до збірки.
+  # E1 ловить змінну compose, якої не читає app/src/config.js (DB_POOL_SIZE у v1.8.0).
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Checker's own tests
+        run: npm run test:tools
+      - name: Deploy checks (D*, C*, E1, W*)
+        run: npm run check:deploy
+
   build:
-    needs: test
+    needs: [test, checks]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:

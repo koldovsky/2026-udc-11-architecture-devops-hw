@@ -14,7 +14,9 @@ x-common-env: &common-env
   DB_POOL_WAIT_MS: "2000"
   SMS_BASE_URL: "https://sms.example.net/api/v2"
   SMS_TOKEN: "${SMS_TOKEN:?SMS_TOKEN must be set in .env}"
-  SMS_RATE_PER_SEC: "20"
+  # Ліміт облікового запису провайдера — 10 SMS/с (materials/vendors/sms-provider.md);
+  # 20 давало щоденні 429 (docs/rca.md). Тримаємо запас нижче ліміту.
+  SMS_RATE_PER_SEC: "8"
   COURIER_BASE_URL: "https://courier.example.com/api/v1"
 
 x-hardening: &hardening
@@ -24,6 +26,9 @@ x-hardening: &hardening
   read_only: true
   tmpfs:
     - /tmp
+    # нічна задача: cron 03:15 → `docker compose run --rm worker npm run expire`
+    # (docs/ops/backup-runbook.md); npm пише кеш і логи в ~/.npm, а rootfs read-only
+    - /home/node/.npm
   cap_drop:
     - ALL
   security_opt:
