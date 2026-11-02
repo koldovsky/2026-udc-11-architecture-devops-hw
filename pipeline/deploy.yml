@@ -9,11 +9,6 @@ on:
 permissions:
   contents: read
 
-# Never cancel an in-flight production deploy.
-concurrency:
-  group: deploy-production
-  cancel-in-progress: false
-
 jobs:
 
   # ─── 1. Tests ───────────────────────────────────────────────────────────────
@@ -83,6 +78,13 @@ jobs:
   deploy:
     name: Deploy to production
     needs: build
+    # Only a release tag (push) or main (workflow_dispatch) may reach production;
+    # a manual run on any other branch still tests and builds, but does not deploy.
+    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main'
+    # Never cancel an in-flight production deploy; tests and builds of other runs stay parallel.
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: production   # → Settings › Environments › production: add required reviewers

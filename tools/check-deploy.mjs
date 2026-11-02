@@ -15,7 +15,7 @@
 // tools/test/<name>.test.mjs (npm run test:tools runs only tools/test/*.test.mjs).
 
 import { execSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -367,6 +367,50 @@ export function imageProblem(image) {
   return null;
 }
 
+// ---------------------------------------------------------------- app config (C5)
+
+// Where the app reads its config: the code that ships in the image. app/test is left out on
+// purpose: tests set variables (process.env.X = …), which says nothing about what the app reads.
+const APP_SOURCE_DIRS = ["app/src", "app/bin"];
+// Read by the Node runtime itself, not by app code, so env.NAME never shows up for them:
+// TZ — the time zone (libc/ICU), NODE_OPTIONS — flags for the node binary.
+const RUNTIME_ENV = new Set(["TZ", "NODE_OPTIONS"]);
+// env.NAME / process.env.NAME / env["NAME"]
+const ENV_READ = /\benv\s*(?:\.\s*([A-Za-z_][A-Za-z0-9_]*)|\[\s*["'`]([A-Za-z_][A-Za-z0-9_]*)["'`]\s*\])/g;
+
+function jsFiles(dir) {
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir, { withFileTypes: true }).flatMap((e) => {
+    const full = join(dir, e.name);
+    if (e.isDirectory()) return e.name === "node_modules" ? [] : jsFiles(full);
+    return /\.[cm]?js$/.test(e.name) ? [full] : [];
+  });
+}
+
+/** Names the app reads from the environment, or null when there is no app source at all. */
+function appEnvReads(root) {
+  const files = APP_SOURCE_DIRS.flatMap((d) => jsFiles(join(root, d)));
+  if (!files.length) return null;
+  const names = new Set();
+  for (const file of files) {
+    for (const m of readFileSync(file, "utf8").matchAll(ENV_READ)) names.add(m[1] ?? m[2]);
+  }
+  return names;
+}
+
+/**
+ * The app's services: those with build: and those running the same image as one of them.
+ * Anything else (postgres, nginx, …) reads its own variables, not ours. With no build: at all
+ * there is nothing to tell them apart by, so every service counts — a loud FAIL beats a silent PASS.
+ */
+function splitAppServices(all) {
+  const built = all.filter(([, svc]) => svc?.build);
+  if (!built.length) return { app: all, thirdParty: [] };
+  const images = new Set(built.map(([, svc]) => svc?.image).filter(Boolean));
+  const isApp = ([, svc]) => Boolean(svc?.build) || images.has(svc?.image);
+  return { app: all.filter(isApp), thirdParty: all.filter((s) => !isApp(s)).map(([name]) => name) };
+}
+
 const isNoneTest = (t) => (Array.isArray(t) ? String(t[0]).toUpperCase() === "NONE" : typeof t === "string" && t.trim().toUpperCase() === "NONE");
 const healthcheckOff = (hc) => hc?.disable === true || isNoneTest(hc?.test);
 
@@ -530,6 +574,27 @@ export const RULES = [
         }
       }
       return problems.length ? fail(problems.join("; ")) : pass("секретоподібні змінні задано посиланнями");
+    },
+  },
+  {
+    id: "C5",
+    title: "Кожну змінну оточення з compose застосунок справді читає",
+    hint: "Назва змінної в environment: має збігатися з тією, яку читає код (env.NAME у app/src або app/bin, зазвичай app/src/config.js) — інакше значення мовчки ігнорується і працює дефолт (так у v1.8.0 DB_POOL_SIZE дав пул 4 замість 20). Перейменовуєте змінну — міняйте разом compose і config.js. Змінні рантайму Node (TZ, NODE_OPTIONS) дозволено. Сервіси зі стороннім образом (без build: і не з образом застосунку, напр. postgres) не перевіряються.",
+    check({ compose, root }) {
+      const problem = composeProblem(compose);
+      if (problem) return problem;
+      const reads = appEnvReads(root);
+      if (!reads) return skip(`немає коду застосунку в ${APP_SOURCE_DIRS.join(", ")} — нема з чим звіряти`);
+      const { app, thirdParty } = splitAppServices(services(compose));
+      const problems = [];
+      const keys = app.flatMap(([name, svc]) => envEntries(svc?.environment).map(([key]) => [name, key]));
+      for (const [name, key] of keys) {
+        if (!reads.has(key) && !RUNTIME_ENV.has(key)) problems.push(`${name}: ${key}`);
+      }
+      if (problems.length) return fail(`застосунок не читає (значення мовчки ігнорується): ${problems.join("; ")}`);
+      const unique = new Set(keys.map(([, key]) => key)).size;
+      const others = thirdParty.length ? `; сторонні образи не перевірялись: ${thirdParty.join(", ")}` : "";
+      return pass(`записів environment: ${keys.length} у сервісах ${app.map(([n]) => n).join(", ")} (унікальних назв: ${unique})${others}`);
     },
   },
   {
