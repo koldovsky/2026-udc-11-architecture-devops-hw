@@ -1,0 +1,177 @@
+# Pipeline: тести → збірка образу → деплой (з ручним погодженням).
+# Щоб GitHub його запустив, файл має лежати в .github/workflows/ (наприклад,
+# скопіювати або зробити symlink: .github/workflows/deploy.yml).
+#
+# Налаштування в GitHub (Settings → Environments → production):
+#   - Required reviewers — це і є ручне погодження перед деплоєм;
+#   - Deployment branches: лише main;
+#   - Environment secrets: DEPLOY_HOST, DEPLOY_USER, DEPLOY_SSH_KEY, DEPLOY_KNOWN_HOSTS.
+# SMS_TOKEN у CI не потрібен: він лежить у /opt/poshtomat/.env на самій VM.
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Мінімум за замовчуванням; розширюється лише на рівні окремих jobs.
+permissions: {}
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+  DEPLOY_DIR: /opt/poshtomat
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Run tests
+        working-directory: app
+        run: npm test
+
+  # Post-mortem 2026-10-14, action item #2: детерміновані перевірки деплою — до збірки.
+  # E1 ловить змінну compose, якої не читає app/src/config.js (DB_POOL_SIZE у v1.8.0).
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Checker's own tests
+        run: npm run test:tools
+      - name: Deploy checks (D*, C*, E1, W*)
+        run: npm run check:deploy
+
+  build:
+    needs: [test, checks]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Compute image name
+        id: meta
+        env:
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          # Імена в реєстрі мають бути в нижньому регістрі.
+          echo "image=${REGISTRY}/${REPO,,}:${SHA}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: app
+          file: deploy/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.image }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Ручне погодження: job чекає, доки reviewer схвалить деплой в environment.
+    environment:
+      name: production
+    permissions:
+      contents: read
+      packages: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Configure SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_deploy
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/id_deploy ~/.ssh/known_hosts
+
+      - name: Upload compose.yaml
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          scp -i ~/.ssh/id_deploy -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes \
+            deploy/compose.yaml "${DEPLOY_USER}@${DEPLOY_HOST}:${DEPLOY_DIR}/compose.yaml"
+
+      - name: Deploy
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          IMAGE: ${{ needs.build.outputs.image }}
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          ssh_vm() {
+            ssh -i ~/.ssh/id_deploy -o StrictHostKeyChecking=yes -o IdentitiesOnly=yes \
+              "${DEPLOY_USER}@${DEPLOY_HOST}" "$@"
+          }
+          # 1) Вхід у реєстр: stdin цього виклику несе лише токен (не в аргументах команди).
+          printf '%s' "$REGISTRY_TOKEN" | ssh_vm "docker login '${REGISTRY}' -u '${REGISTRY_USER}' --password-stdin"
+          # 2) Деплой: stdin цього виклику несе лише сценарій. Окремі виклики, бо
+          #    here-document замінив би stdin з токеном.
+          ssh_vm "bash -s -- '${REGISTRY}' '${IMAGE}' '${DEPLOY_DIR}'" <<'REMOTE'
+          set -euo pipefail
+          registry="$1"; image="$2"; dir="$3"
+          trap 'docker logout "$registry" >/dev/null 2>&1 || true' EXIT
+          cd "$dir"
+          # .env містить SMS_TOKEN: усі файли, що його копіюють, — лише для власника.
+          umask 077
+          touch .env
+          # Образ, що йде в роботу, фіксується в .env; попередній — у PREVIOUS_IMAGE
+          # для відкату (docs/runbook.md). prune нижче прибирає лише образи без тегу.
+          prev="$(grep '^IMAGE=' .env | cut -d= -f2- || true)"
+          grep -vE '^(IMAGE|PREVIOUS_IMAGE)=' .env > .env.new || true
+          # той самий образ ще раз — PREVIOUS_IMAGE не чіпаємо, інакше відкату нікуди
+          if [ -n "$prev" ] && [ "$prev" != "$image" ]; then
+            echo "PREVIOUS_IMAGE=${prev}" >> .env.new
+          else
+            grep '^PREVIOUS_IMAGE=' .env >> .env.new || true
+          fi
+          echo "IMAGE=${image}" >> .env.new
+          chmod 600 .env.new
+          mv .env.new .env
+          docker compose pull
+          docker compose up -d --remove-orphans --wait --wait-timeout 60
+          docker image prune -f
+          REMOTE
+
+      - name: Cleanup SSH material
+        if: always()
+        run: rm -f ~/.ssh/id_deploy ~/.ssh/known_hosts
