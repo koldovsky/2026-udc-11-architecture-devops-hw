@@ -12,7 +12,7 @@
 #   2. зберегти робочий файл як compose.yaml.prev, підмінити, up --wait (api має стати healthy);
 #   3. функціональна перевірка: розмір пулу в api і worker = DB_POOL_MAX, проба через пул api,
 #      перший цикл worker без помилок;
-#   4. лише після успіху записати IMAGE/IMAGE_TAG у .env і рядок у deploys.log.
+#   4. лише після успіху атомарно записати IMAGE/IMAGE_TAG у .env і рядок у deploys.log.
 # Будь-який збій на кроках 2–3 → повертаємо compose.yaml.prev і образ з .env, вихід ≠ 0.
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -87,8 +87,18 @@ mv compose.yaml.new compose.yaml
 docker compose up -d --remove-orphans --no-build --wait --wait-timeout 120 || rollback 'api не став healthy за 120 с'
 smoke || rollback 'функціональна перевірка не пройшла'
 
-touch .env
-sed -i '/^IMAGE=/d; /^IMAGE_TAG=/d' .env
-printf 'IMAGE=%s\nIMAGE_TAG=%s\n' "$IMAGE" "$IMAGE_TAG" >> .env
-printf '%s   deploy    %s   %s   image %s, run %s\n' "$(date -Iseconds)" "$ref" "$actor" "$IMAGE_TAG" "$run_id" >> deploys.log
-docker image prune -f
+# Новий IMAGE/IMAGE_TAG у .env — атомарно: повна копія (з тими самими правами — там секрети)
+# правиться поруч і лише потім одним mv заміняє .env. Збій запису лишає старий .env цілим, і
+# відкат на попередній образ з нього коректний.
+write_env() {
+  touch .env &&
+    cp -p .env .env.tmp &&
+    sed -i '/^IMAGE=/d; /^IMAGE_TAG=/d' .env.tmp &&
+    printf 'IMAGE=%s\nIMAGE_TAG=%s\n' "$IMAGE" "$IMAGE_TAG" >> .env.tmp &&
+    mv .env.tmp .env
+}
+write_env || { rm -f .env.tmp; rollback 'не вдалося записати .env'; }
+# Журнал — для людей; збій запису в нього не скасовує вже перевірений і зафіксований у .env реліз.
+printf '%s   deploy    %s   %s   image %s, run %s\n' "$(date -Iseconds)" "$ref" "$actor" "$IMAGE_TAG" "$run_id" >> deploys.log ||
+  echo 'deploy: УВАГА — реліз працює, але рядок у deploys.log не записано' >&2
+docker image prune -f || true
