@@ -28,10 +28,29 @@ jobs:
 
       - run: npm test
 
+  # ─── 1б. Перевірка конфігу деплою (з кореня репо) ───────────────────────────
+  # Детермінований перевіряльник tools/check-deploy.mjs, зокрема правило C5 з post-mortem
+  # (action item #1): compose із змінною, яку застосунок не читає (як DB_POOL_SIZE у v1.8.0),
+  # зупиняє pipeline тут — до збірки образу і деплою.
+  deploy-checks:
+    name: Deploy config checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - run: npm run test:tools
+
+      - run: npm run check:deploy
+
   # ─── 2. Збірка й публікація образу ──────────────────────────────────────────────────
   build:
     name: Build & push image
-    needs: test
+    needs: [test, deploy-checks]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
