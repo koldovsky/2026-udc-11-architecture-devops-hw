@@ -1,35 +1,121 @@
 # Поштомат громади — продакшн на одній VM (docker compose up -d).
 # PostgreSQL працює на самій VM, поза compose.
-services:
-  api:
-    image: poshtomat:latest
-    build:
-      context: ../app
-      dockerfile: ../deploy/Dockerfile
-    ports:
-      - "8080:8080"
-    environment:
-      TZ: "Europe/Kyiv"
-      PORT: "8080"
-      LOG_LEVEL: "info"
-      DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
-      DB_POOL_MAX: "20"
-      DB_POOL_WAIT_MS: "2000"
-      SMS_BASE_URL: "https://sms.example.net/api/v2"
-      SMS_TOKEN: "CHANGE_ME"
-      SMS_RATE_PER_SEC: "20"
-      COURIER_BASE_URL: "https://courier.example.com/api/v1"
+#
+# Образ приходить з реєстру за незмінним digest — його підставляє CI
+# (pipeline/deploy.yml). Секції `build:` тут навмисно немає: на VM не повинен
+# опинитися образ, зібраний на місці й не проходивши тестів.
+#
+# Поряд із цим файлом лежить `.env` (0600, root), який заводить оператор один
+# раз і який CI не чіпає, крім рядка IMAGE:
+#
+#   IMAGE=ghcr.io/<owner>/<repo>@sha256:...
+#   DATABASE_URL=postgres://poshtomat:<пароль>@db-host:5432/poshtomat
+#   SMS_TOKEN=<токен SMS-провайдера>
+#
+# Синтаксис `${VAR:?...}` означає, що без цих змінних compose відмовиться
+# стартувати, замість того щоб тихо піднятися з CHANGE_ME.
+#
+# Один якір `x-env` на всі три сервіси — це навмисно: образ один, `loadConfig`
+# один, тому й набір змінних має бути один. Саме через це 14.10 інцидент зачепив
+# і api, і worker (`docs/rca.md`): змінну перейменували в обох блоках одразу.
+# Правило `C5` у `tools/check-deploy.mjs` стежить, що цей набір точно збігається
+# з тим, що читає `app/src/config.js`.
 
+x-env: &env
+  TZ: "Europe/Kyiv"
+  NODE_ENV: "production"
+  PORT: "8080"
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  # УВАГА — стан репозиторію, не продакшну. DATABASE_URL тут заданий, але код його
+  # лише читає й нікуди не передає: `createPool` щоразу створює власне сховище в
+  # пам'яті (`app/src/db.js:63`), і жоден із трьох входів не передає `store`
+  # (`app/src/server.js:91`, `app/src/worker.js:43`, `app/bin/expire-parcels.js:24`).
+  # Тобто як є api, worker і expire працюють із трьома окремими сховищами, а не зі
+  # спільним PostgreSQL — див. `docs/architecture.md`, «Рівень 2». У продакшні той
+  # самий інтерфейс має працювати поверх PostgreSQL (`app/README.md:23-24`), але цього
+  # шару в репозиторії немає. Перед розгортанням цього файла з реальними даними
+  # спершу зробіть його і перевірте, що всі три входи бачать одні й ті самі посилки.
+  DATABASE_URL: "${DATABASE_URL:?DATABASE_URL must be set in the .env next to this file}"
+  DB_POOL_MAX: ${DB_POOL_MAX:-20}
+  DB_POOL_WAIT_MS: ${DB_POOL_WAIT_MS:-2000}
+  SMS_BASE_URL: ${SMS_BASE_URL:-https://sms.example.net/api/v2}
+  SMS_TOKEN: "${SMS_TOKEN:?SMS_TOKEN must be set in the .env next to this file}"
+  SMS_RATE_PER_SEC: ${SMS_RATE_PER_SEC:-20}
+  COURIER_BASE_URL: ${COURIER_BASE_URL:-https://courier.example.com/api/v1}
+
+# Спільна частина всіх трьох сервісів: один образ, однакове посилення.
+x-service: &service
+  image: "${IMAGE:?IMAGE must be set to the digest-pinned image built by CI}"
+  read_only: true
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=16m
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  # PostgreSQL слухає на самій VM, поза контейнерами: db-host вказує на шлюз
+  # хоста, тому DATABASE_URL може звертатися до нього за іменем.
+  extra_hosts:
+    - "db-host:host-gateway"
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+
+services:
+  # HTTP API. healthcheck успадкований з образу (GET /health).
+  api:
+    <<: *service
+    restart: unless-stopped
+    environment: *env
+    # Публікуємо лише на loopback: назовні API віддає реверс-проксі на VM,
+    # інакше "8080:8080" відкрив би його на всіх інтерфейсах.
+    ports:
+      - "127.0.0.1:8080:8080"
+    stop_grace_period: 20s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+        reservations:
+          memory: 128M
+
+  # Розсилка SMS про прибуття. Порту не слухає, тому healthcheck з образу
+  # вимкнений — інакше контейнер вічно був би unhealthy.
   worker:
-    image: poshtomat:latest
+    <<: *service
+    restart: unless-stopped
     command: ["node", "src/worker.js"]
-    environment:
-      TZ: "Europe/Kyiv"
-      LOG_LEVEL: "info"
-      DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
-      DB_POOL_MAX: "20"
-      DB_POOL_WAIT_MS: "2000"
-      SMS_BASE_URL: "https://sms.example.net/api/v2"
-      SMS_TOKEN: "CHANGE_ME"
-      SMS_RATE_PER_SEC: "20"
-      COURIER_BASE_URL: "https://courier.example.com/api/v1"
+    environment: *env
+    healthcheck:
+      disable: true
+    # Воркер перевіряє прапорець зупинки раз на POLL_INTERVAL_MS (10 с), тому
+    # на коректне завершення раунду потрібно більше часу, ніж типові 10 с.
+    stop_grace_period: 45s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+
+  # Нічна задача (cron на VM, не піднімається через `up` — профіль jobs):
+  #   docker compose -f /opt/poshtomat/compose.yaml run --rm expire
+  expire:
+    <<: *service
+    restart: "no"
+    profiles: ["jobs"]
+    command: ["node", "bin/expire-parcels.js"]
+    environment: *env
+    healthcheck:
+      disable: true
+    # Разова задача теж з лімітом: вона стартує вночі поруч із api і worker, і
+    # без ліміту саме вона — найімовірніший кандидат вичерпати пам'ять VM.
+    # Разом: 512M (api) + 256M (worker) + 256M = 1 GiB на час нічного прогону,
+    # решта VM лишається PostgreSQL і системі.
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
