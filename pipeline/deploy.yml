@@ -1,3 +1,6 @@
+# GitHub запускає workflow лише з .github/workflows/. За умовою завдання файл лежить у pipeline/
+# (docs/walkthrough.md, Task D) і в репо курсу не запускається; щоб увімкнути в робочому репо —
+# скопіювати його в .github/workflows/deploy.yml.
 name: CI / Deploy
 
 on:

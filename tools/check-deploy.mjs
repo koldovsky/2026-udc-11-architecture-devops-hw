@@ -387,13 +387,46 @@ function jsFiles(dir) {
   });
 }
 
+/**
+ * JS source with // and /* *\/ comments blanked out (newlines kept), so that `env.X` mentioned
+ * only in a comment does not count as a read. String and template literals are kept as they
+ * are: env["NAME"] needs its string, and "http://…" inside a string is not a comment.
+ * Regex literals are not recognised (app code has none that contain // or /*).
+ */
+export function stripJsComments(text) {
+  let out = "";
+  let quote = null; // ', " or ` while inside a string literal
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (quote) {
+      out += c;
+      if (c === "\\") out += text[++i] ?? "";
+      else if (c === quote) quote = null;
+    } else if (c === "'" || c === '"' || c === "`") {
+      quote = c;
+      out += c;
+    } else if (c === "/" && text[i + 1] === "/") {
+      while (i < text.length && text[i] !== "\n") i++;
+      out += "\n";
+    } else if (c === "/" && text[i + 1] === "*") {
+      const end = text.indexOf("*/", i + 2);
+      const stop = end === -1 ? text.length : end + 2;
+      out += text.slice(i, stop).replace(/[^\n]/g, " ");
+      i = stop - 1;
+    } else {
+      out += c;
+    }
+  }
+  return out;
+}
+
 /** Names the app reads from the environment, or null when there is no app source at all. */
 function appEnvReads(root) {
   const files = APP_SOURCE_DIRS.flatMap((d) => jsFiles(join(root, d)));
   if (!files.length) return null;
   const names = new Set();
   for (const file of files) {
-    for (const m of readFileSync(file, "utf8").matchAll(ENV_READ)) names.add(m[1] ?? m[2]);
+    for (const m of stripJsComments(readFileSync(file, "utf8")).matchAll(ENV_READ)) names.add(m[1] ?? m[2]);
   }
   return names;
 }

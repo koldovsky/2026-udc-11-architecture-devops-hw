@@ -149,3 +149,22 @@ test("C5 ignores a third-party service but still checks the app services next to
   assert.match(bad.message, /api: DB_POOL_SIZE; worker: DB_POOL_SIZE$/); // worker shares the image of api
   assert.doesNotMatch(bad.message, /POSTGRES/);
 });
+
+// A name mentioned only in a comment is not a read: the v1.8.0 rename with a leftover note in
+// config.js must still FAIL. "http://…" inside a string is not a comment, so a real read after
+// it on the same line still counts.
+test("C5 does not count env.NAME in comments, but keeps reads after // inside strings", () => {
+  const commented = [
+    "// DB_POOL_SIZE was renamed: env.DB_POOL_SIZE is gone, read env.DB_POOL_MAX instead",
+    "/* old: Number(env.DB_POOL_SIZE) */",
+    CONFIG_JS,
+  ].join("\n");
+  const bad = checkTree({ "deploy/compose.yaml": composeWithPool("DB_POOL_SIZE"), "app/src/config.js": commented });
+  assert.equal(bad.status, "FAIL");
+  assert.match(bad.message, /api: DB_POOL_SIZE; worker: DB_POOL_SIZE$/);
+
+  const withUrl = CONFIG_JS + 'export const base = "http://sms.local/" + (process.env.SMS_SENDER ?? "");\n';
+  const compose = composeWithPool("DB_POOL_MAX").replace("      PORT: \"8080\"", "      PORT: \"8080\"\n      SMS_SENDER: \"Poshtomat\"");
+  const ok = checkTree({ "deploy/compose.yaml": compose, "app/src/config.js": withUrl });
+  assert.equal(ok.status, "PASS", ok.message);
+});
