@@ -1,0 +1,239 @@
+# Тести → збірка образу → деплой на VM після ручного погодження.
+#
+# GitHub запускає workflow лише з .github/workflows/, тому туди треба покласти копію цього
+# файлу. Сам файл лишається тут: його читає tools/check-deploy.mjs.
+# Шляхи нижче задані від кореня репозиторію (app/, deploy/).
+#
+# Ручне погодження дає не сам ключ environment:, а Required reviewers у
+# Settings → Environments → production. Без них деплой піде без погодження.
+#
+# Секрети оточення production:
+#   DEPLOY_HOST, DEPLOY_USER  — VM і користувач у групі docker
+#   DEPLOY_SSH_KEY            — приватний ключ лише для деплою
+#   DEPLOY_KNOWN_HOSTS        — рядок(ки) з ssh-keyscan, звірені з VM
+#   DATABASE_URL, SMS_TOKEN   — налаштування сервісу
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Без кешу npm і npm ci: залежностей і lock-файла немає.
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24" # та сама версія, що в deploy/Dockerfile
+      - name: Run tests
+        working-directory: app
+        run: npm test
+      # Без цього кроку правило E1 (змінні compose звірено з кодом) нічого не захищає.
+      - name: Check deploy configuration
+        run: node tools/check-deploy.mjs
+
+  build:
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.push.outputs.image }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build image
+        run: |
+          # Назва образу в реєстрі має бути в нижньому регістрі, а назва репозиторію — не обов'язково.
+          echo "IMAGE=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_ENV"
+          docker build --pull \
+            --file deploy/Dockerfile \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --tag "ghcr.io/${GITHUB_REPOSITORY,,}:$GITHUB_SHA" \
+            app
+
+      - name: Smoke-test image
+        run: |
+          # Ті самі обмеження, що в compose.yaml, щоб образ, який їх не витримує, не дійшов до реєстру.
+          docker run --detach --name smoke \
+            --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges \
+            --publish 127.0.0.1:18080:8080 \
+            "$IMAGE:$GITHUB_SHA"
+          for _ in $(seq 1 15); do
+            if curl --fail --silent --show-error http://127.0.0.1:18080/health; then
+              docker rm --force smoke
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs smoke
+          exit 1
+
+      - name: Push image
+        id: push
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker push --quiet "$IMAGE:$GITHUB_SHA"
+          # Деплоїмо за дайджестом: погоджений образ уже не підміниш перезаписом тега.
+          ref="$(docker inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$GITHUB_SHA")"
+          if [[ ! "$ref" =~ ^"$IMAGE"@sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::Unexpected image reference: $ref"
+            exit 1
+          fi
+          echo "image=$ref" >> "$GITHUB_OUTPUT"
+          docker logout ghcr.io
+
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # Секрети оточення стають доступні завданню лише після погодження.
+    environment: production
+    concurrency:
+      group: production-deploy
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: read
+    env:
+      DEPLOY_DIR: /opt/poshtomat
+      IMAGE: ${{ needs.build.outputs.image }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Configure SSH
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          : "${DEPLOY_HOST:?secret is not set}" "${DEPLOY_USER:?secret is not set}"
+          : "${DEPLOY_SSH_KEY:?secret is not set}" "${DEPLOY_KNOWN_HOSTS:?secret is not set}"
+          umask 077
+          ssh_dir="$RUNNER_TEMP/ssh"
+          mkdir -p "$ssh_dir"
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$ssh_dir/key"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$ssh_dir/known_hosts"
+          # Ключ хоста беремо із секрету, а не з ssh-keyscan: так підміну VM буде помічено.
+          cat > "$ssh_dir/config" <<EOF
+          Host vm
+            HostName $DEPLOY_HOST
+            User $DEPLOY_USER
+            IdentityFile $ssh_dir/key
+            IdentitiesOnly yes
+            UserKnownHostsFile $ssh_dir/known_hosts
+            StrictHostKeyChecking yes
+            BatchMode yes
+            ConnectTimeout 15
+            ServerAliveInterval 15
+          EOF
+          echo "SSH_CONFIG=$ssh_dir/config" >> "$GITHUB_ENV"
+
+      - name: Upload compose.yaml and .env
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SMS_TOKEN: ${{ secrets.SMS_TOKEN }}
+        run: |
+          for name in DATABASE_URL SMS_TOKEN; do
+            value="${!name}"
+            if [ -z "$value" ]; then
+              echo "::error::Secret $name is not set"
+              exit 1
+            fi
+            # Значення йдуть у .env в одинарних лапках: так $ лишається буквальним символом.
+            if [[ "$value" == *"'"* || "$value" == *$'\n'* ]]; then
+              echo "::error::Secret $name must not contain single quotes or newlines"
+              exit 1
+            fi
+          done
+          # Секрети передаємо через stdin, щоб вони не потрапили в аргументи команд на VM.
+          printf "POSHTOMAT_IMAGE='%s'\nDATABASE_URL='%s'\nSMS_TOKEN='%s'\n" \
+            "$IMAGE" "$DATABASE_URL" "$SMS_TOKEN" |
+            ssh -F "$SSH_CONFIG" vm "umask 077 && cat > '$DEPLOY_DIR/.env.new'"
+          scp -F "$SSH_CONFIG" deploy/compose.yaml "vm:$DEPLOY_DIR/compose.yaml.new"
+
+      - name: Log in to GHCR on the VM
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Окремий тимчасовий конфіг: токен живе лише до кінця завдання і не змішується з ~/.docker.
+          printf '%s' "$GHCR_TOKEN" |
+            ssh -F "$SSH_CONFIG" vm \
+              "umask 077 && cd '$DEPLOY_DIR' && docker --config .docker-ci login ghcr.io --username '$GITHUB_ACTOR' --password-stdin"
+
+      - name: Deploy with rollback
+        run: |
+          ssh -F "$SSH_CONFIG" vm "bash -s -- '$DEPLOY_DIR' '$IMAGE'" <<'REMOTE'
+          # Усе у функції: bash читає її цілком, тож дочірні команди не з'їдять решту скрипта зі stdin.
+          main() {
+            set -euo pipefail
+            cd "$1"
+            local image="$2" have_prev=false
+            trap 'rm -rf .docker-ci .env.new compose.yaml.new .env.prev compose.yaml.prev' EXIT
+
+            # Перевіряємо конфігурацію і тягнемо образ до того, як чіпати робочі контейнери.
+            docker compose --env-file .env.new -f compose.yaml.new config --quiet
+            docker --config .docker-ci pull --quiet "$image"
+
+            if [ -f .env ] && [ -f compose.yaml ]; then
+              cp -p .env .env.prev
+              cp -p compose.yaml compose.yaml.prev
+              have_prev=true
+            fi
+            mv .env.new .env
+            mv compose.yaml.new compose.yaml
+
+            if docker compose up --detach --wait --wait-timeout 120 --remove-orphans; then
+              docker image prune --all --force \
+                --filter "label=org.opencontainers.image.title=poshtomat" \
+                --filter "until=336h" || true
+              return 0
+            fi
+
+            # Логи застосунку сюди не виводимо: журнали Actions бачать ширше коло людей.
+            echo "::error::New version did not become healthy"
+            docker compose ps --all
+            if [ "$have_prev" = true ]; then
+              echo "Rolling back to the previous version"
+              mv .env.prev .env
+              mv compose.yaml.prev compose.yaml
+              docker compose up --detach --wait --wait-timeout 120 --remove-orphans ||
+                echo "::error::Rollback did not become healthy, the VM needs attention"
+            fi
+            return 1
+          }
+          main "$@"
+          REMOTE
+
+      - name: Clean up
+        if: always()
+        run: |
+          if [ -f "${SSH_CONFIG:-}" ]; then
+            ssh -F "$SSH_CONFIG" vm "cd '$DEPLOY_DIR' && rm -rf .docker-ci .env.new compose.yaml.new" || true
+            rm -rf "$(dirname "$SSH_CONFIG")"
+          fi
