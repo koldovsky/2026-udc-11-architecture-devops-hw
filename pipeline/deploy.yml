@@ -143,17 +143,23 @@ jobs:
             StrictHostKeyChecking yes
           EOF
 
-      # Скопіювати актуальний compose-файл на сервер.
+      # Скопіювати новий compose-файл на сервер ПОРУЧ із робочим (compose.yaml.new): робочий
+      # compose.yaml замінюється лише в наступному кроці, після перевірки файлу і pull образу.
       - name: Upload compose file
-        run: scp deploy/compose.yaml prod:/opt/poshtomat/compose.yaml
+        run: scp deploy/compose.yaml prod:/opt/poshtomat/compose.yaml.new
 
       # Стягнути новий образ і перестворити контейнери (короткий простій, поки compose їх перестворює).
       # GHCR_TOKEN — PAT з правом packages:read у секретах репо. Він іде у віддалений docker login
       # через stdin (не аргументом), тож не видний у списку процесів і в історії shell на сервері.
-      # Лише ПІСЛЯ успішних pull і up IMAGE та IMAGE_TAG записуються в /opt/poshtomat/.env (решта
+      # Порядок: перевірити compose.yaml.new (`config -q`) і стягнути образ → лише тоді зберегти
+      # робочий файл як compose.yaml.prev і підмінити → `up --wait` чекає, поки api стане healthy
+      # (HEALTHCHECK з образу; у worker перевірку вимкнено — для нього досить running). Не дочекались
+      # за 120 с → повертаємо compose.yaml.prev і образ з .env, крок падає.
+      # Лише ПІСЛЯ успішного `up --wait` IMAGE та IMAGE_TAG записуються в /opt/poshtomat/.env (решта
       # рядків — секрети, які веде адміністратор, — не чіпаються) і додається рядок у deploys.log.
       # Тож пізніші `docker compose …` у цій теці (runbook, відкат) працюють з тим самим проєктом
       # `poshtomat` і з образом, який справді запущено, а невдалий деплой не потрапляє в історію.
+      # Потрібен Docker Compose v2 з `up --wait-timeout`; скрипт перевіряє це першим кроком.
       # Усе, що підставляється в текст віддаленої команди, спершу звіряється з суворим шаблоном:
       # назва тегу чи гілки, логін тощо можуть містити `$(…)`, `;` або лапки, а віддалений shell
       # розбирає рядок ще раз.
@@ -172,9 +178,20 @@ jobs:
           printf '%s\n' "$GHCR_TOKEN" | ssh prod "docker login ghcr.io -u '$GHCR_USER' --password-stdin"
           ssh prod "set -eu
             cd /opt/poshtomat
+            docker compose up --help | grep -q -- --wait-timeout || {
+              echo 'docker compose на VM не підтримує up --wait-timeout — оновіть Compose v2' >&2; exit 1; }
             export IMAGE='$IMAGE' IMAGE_TAG='$IMAGE_TAG'
-            docker compose pull --quiet api worker
-            docker compose up -d --remove-orphans --no-build
+            docker compose -f compose.yaml.new config -q
+            docker compose -f compose.yaml.new pull --quiet api worker
+            if [ -f compose.yaml ]; then cp compose.yaml compose.yaml.prev; fi
+            mv compose.yaml.new compose.yaml
+            if ! docker compose up -d --remove-orphans --no-build --wait --wait-timeout 120; then
+              echo 'api не став healthy за 120 с — повертаю попередній compose.yaml і образ з .env' >&2
+              if [ -f compose.yaml.prev ]; then mv compose.yaml.prev compose.yaml; fi
+              unset IMAGE IMAGE_TAG
+              docker compose up -d --remove-orphans --no-build || echo 'відкат не вдався — див. docs/runbook.md' >&2
+              exit 1
+            fi
             touch .env
             sed -i '/^IMAGE=/d; /^IMAGE_TAG=/d' .env
             printf 'IMAGE=%s\nIMAGE_TAG=%s\n' '$IMAGE' '$IMAGE_TAG' >> .env
