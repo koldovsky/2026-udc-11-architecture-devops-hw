@@ -37,19 +37,19 @@
 |---|---|---|
 | 13:24 (13.10) | Для порівняння: напередодні, без жодного деплою, 429 від SMS-провайдера почались у той самий час | `grep -m1 'rate limited' incident/baseline/worker-2026-10-13.jsonl \| cut -c8-36` → `2026-10-13T13:24:56.679+03:00` |
 | 13:28:51 | Перший `sms provider rate limited` (429) у worker-і — щоденний піковий шум | `grep -m1 'rate limited' incident/logs/worker-2026-10-14.jsonl \| cut -c8-36` → `2026-10-14T13:28:51.244+03:00` |
-| 13:37 | Алерт `SmsProvider429RateHigh` (warning), закрився о 15:03 | `grep -oE '"(name\|fired_at\|resolved_at)": "[^"]*"' incident/alerts.json \| paste - - -` → рядок 1: `"SmsProvider429RateHigh" "fired_at": "2026-10-14T13:37:00+03:00" "resolved_at": "2026-10-14T15:03:00+03:00"` |
+| 13:37 | Алерт `SmsProvider429RateHigh` (warning), закрився о 15:03 | `grep -oE -e '"name": "[^"]*"' -e '"fired_at": "[^"]*"' -e '"resolved_at": "[^"]*"' incident/alerts.json \| paste -d' ' - - -` (по рядку на алерт) → рядок 1: `"name": "SmsProvider429RateHigh" "fired_at": "2026-10-14T13:37:00+03:00" "resolved_at": "2026-10-14T15:03:00+03:00"` |
 | 14:01:37 | Одиночний `TLS handshake timeout to sms.example.net` у worker-і (ще v1.7.3) | `grep 'TLS handshake' incident/logs/worker-2026-10-14.jsonl \| cut -c8-36` → `2026-10-14T14:01:37.954+03:00` |
-| 14:01:58 | API отримує SIGTERM — початок деплою | `grep -E 'shutting down\|service started' incident/logs/api-2026-10-14.jsonl \| cut -c8-36,58-` → рядок 1: `2026-10-14T14:01:58.214+03:00":"shutting down","signal":"SIGTERM"}` |
+| 14:01:58 | API отримує SIGTERM — початок деплою | `grep -e 'shutting down' -e 'service started' incident/logs/api-2026-10-14.jsonl \| cut -c8-36,58-` → рядок 1: `2026-10-14T14:01:58.214+03:00":"shutting down","signal":"SIGTERM"}` |
 | 14:02:00 | Деплой v1.8.0 («config cleanup (#212)»); API стартує з `version 1.8.0` | `awk '/^2026-10-14/{print $1,$2,$3}' incident/deploys.log` → `2026-10-14T14:02:00+03:00 deploy v1.8.0`; та сама `grep -E …` → `2026-10-14T14:02:00.087+03:00":"service started","version":"1.8.0"}` |
 | 14:02 | `db_pool_in_use` падає з 12 до рівно 4, з'являється черга `db_pool_waiting` | `awk -F, '$1 ~ /T14:0[1-6]/' incident/metrics/2026-10-14.csv` → `…T14:01:00+03:00,11.3,245,0.0044,12,0,76,33` / `…T14:02:00+03:00,11.9,945,0.0042,4,4,42,44` |
 | 14:02:07 | Перший `db pool wait timeout after 2000ms` → 503 (через 7 с після старту v1.8.0) | `grep -m1 'db pool wait timeout' incident/logs/api-2026-10-14.jsonl \| cut -c8-36` → `2026-10-14T14:02:07.172+03:00` |
 | 14:03–14:05 | p95 2446 → 3477 → 4565 мс, error_rate 3,3 % → 6,8 % → 11,9 %, черга 10 → 15 → 20 | та сама `awk … T14:0[1-6]` → `…14:03…,11,2446,0.0333,4,10,43,34` / `…14:04…,11.7,3477,0.0684,4,15,50,32` / `…14:05…,11.8,4565,0.1186,4,20,56,34` |
-| 14:06 | Page `ApiLatencyP95High` | `… alerts.json \| paste - - -` → рядок 2: `"fired_at": "2026-10-14T14:06:00+03:00"` |
-| 14:07 | Page `Api5xxRateHigh` | `… alerts.json \| paste - - -` → рядок 3: `"fired_at": "2026-10-14T14:07:00+03:00"` |
+| 14:06 | Page `ApiLatencyP95High` | `… alerts.json \| paste -d' ' - - -` → рядок 2: `"fired_at": "2026-10-14T14:06:00+03:00"` |
+| 14:07 | Page `Api5xxRateHigh` | `… alerts.json \| paste -d' ' - - -` → рядок 3: `"fired_at": "2026-10-14T14:07:00+03:00"` |
 | 14:20:31 | Перезапуск лише API, та сама v1.8.0; черга на хвилину падає до 6 і знову 20 | `awk '/^2026-10-14/{print $1,$2,$3}' incident/deploys.log` → `2026-10-14T14:20:31+03:00 restart v1.8.0`; `awk -F, '$1 ~ /T14:2[01]/' incident/metrics/2026-10-14.csv` → `…14:20…,11.1,3270,0.0676,4,6,43,37` / `…14:21…,11.7,4588,0.1068,4,20,42,36` |
 | 14:46:58 | Останній `db pool wait timeout` | `grep 'db pool wait timeout' incident/logs/api-2026-10-14.jsonl \| tail -1 \| cut -c8-36` → `2026-10-14T14:46:58.204+03:00` |
 | 14:47:00 | Відкат на v1.7.3; `db_pool_in_use` одразу 14 (> 4), черга 0, p95 618 мс | `awk '/^2026-10-14/{print $1,$2,$3}' incident/deploys.log` → `2026-10-14T14:47:00+03:00 rollback v1.7.3`; `awk -F, '$1 ~ /T14:4[6-8]/' incident/metrics/2026-10-14.csv` → `…14:46…,11.1,4697,0.1186,4,17,65,30` / `…14:47…,11.5,618,0.0014,14,0,46,40` / `…14:48…,11.4,296,0.0015,11,0,44,36` |
-| 14:48 | Обидва page-алерти закрито | `… alerts.json \| paste - - -` → рядки 2–3: `"resolved_at": "2026-10-14T14:48:00+03:00"` |
+| 14:48 | Обидва page-алерти закрито | `… alerts.json \| paste -d' ' - - -` → рядки 2–3: `"resolved_at": "2026-10-14T14:48:00+03:00"` |
 | 15:01–15:03 | 429 від SMS-провайдера вщухають (як і 13.10 — о 15:01), warning закрито о 15:03 | `grep 'rate limited' incident/logs/worker-2026-10-14.jsonl \| tail -1 \| cut -c8-36` → `2026-10-14T15:01:15.660+03:00` (13.10: `…/baseline/worker-2026-10-13.jsonl` → `2026-10-13T15:01:51.930+03:00`) |
 
 ## Першопричина
