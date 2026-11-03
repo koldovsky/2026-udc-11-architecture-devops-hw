@@ -1,0 +1,250 @@
+# Поштомат громади: тести → збірка образу → деплой на VM з ручним погодженням.
+#
+# Лежить у pipeline/, а не в .github/workflows/, щоб не запускатися в репо курсу і
+# в чужих форках. У власному репо команди — скопіювати в .github/workflows/deploy.yml.
+#
+# Налаштування репозиторію (Settings → Environments → production):
+#   * Required reviewers — хто погоджує деплой (без цього environment: НЕ зупиняє job).
+#   * Deployment branches — лише main.
+#   * Environment secrets:
+#       DEPLOY_SSH_KEY      — приватний ключ окремого deploy-користувача на VM
+#       DEPLOY_KNOWN_HOSTS  — рядок known_hosts VM (ssh-keyscan -t ed25519 <host>, звірений вручну)
+#       DATABASE_URL        — postgres://poshtomat:<пароль>@192.0.2.10:5432/poshtomat
+#       SMS_TOKEN           — токен SMS-провайдера
+#   * Environment variables (не секрети): DEPLOY_HOST, DEPLOY_USER
+#
+# Підготовка VM — один раз, адміністратор з sudo (у пайплайна sudo немає):
+#   sudo useradd --create-home --shell /bin/bash deploy   # це DEPLOY_USER
+#   sudo usermod -aG docker deploy                        # docker compose без sudo
+#   sudo install -d -m 750 -o deploy -g deploy /opt/poshtomat
+#   публічна частина DEPLOY_SSH_KEY — у ~deploy/.ssh/authorized_keys
+# APP_DIR (/opt/poshtomat) має належати DEPLOY_USER: пайплайн пише туди compose.yaml,
+# .env і їхні знімки *.previous. Сам він каталог у /opt створити не може —
+# без цього кроку `install -d` на кроці «Передати…» впаде з Permission denied.
+#
+# Сторонні дії закріплено повним SHA коміту (тег — у коментарі; звірено git ls-remote 2026-11-03).
+
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# За замовчуванням — жодних прав; кожна job просить лише потрібне.
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  NODE_VERSION: "24.22.2" # та сама версія, що й у deploy/Dockerfile
+
+jobs:
+  test:
+    name: Тести і перевірки деплою
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+      - name: Тести застосунку
+        working-directory: app
+        run: npm test
+      # Детерміновані правила для deploy/ і pipeline/, зокрема E1: кожна змінна в
+      # compose — та, яку читає app/src/config.js (урок інциденту 2026-10-14).
+      - name: Перевірки деплою
+        run: npm run test:tools && npm run check:deploy
+
+  build:
+    name: Збірка образу
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write # push у GHCR через GITHUB_TOKEN
+    outputs:
+      registry: ${{ steps.name.outputs.registry }}
+      tag: ${{ steps.name.outputs.tag }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Ім'я і тег образу (GHCR вимагає нижній регістр)
+        id: name
+        run: |
+          echo "registry=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+          echo "tag=sha-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: app
+          file: deploy/Dockerfile
+          push: true
+          provenance: mode=max
+          sbom: true
+          # тег на коміт ніколи не перезаписується — відкат = попередній IMAGE_TAG
+          tags: ${{ steps.name.outputs.registry }}/poshtomat:${{ steps.name.outputs.tag }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+  deploy:
+    name: Деплой у production
+    needs: build
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # Ручне погодження: job чекає Required reviewers з environment "production".
+    environment:
+      name: production
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    permissions:
+      contents: read  # checkout deploy/compose.yaml
+      packages: read  # короткоживучий GITHUB_TOKEN, щоб VM стягнула образ з GHCR
+    env:
+      IMAGE_REGISTRY: ${{ needs.build.outputs.registry }}
+      IMAGE_TAG: ${{ needs.build.outputs.tag }}
+      DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
+      DEPLOY_USER: ${{ vars.DEPLOY_USER }}
+      APP_DIR: /opt/poshtomat
+      # Відкат до стану перед цим деплоєм — спільний для кроків деплою і smoke-тесту.
+      # Обидва знімки *.previous є, лише якщо до деплою на VM уже працювала версія.
+      # Інакше (перший деплой) повертатися нема до чого: стек невдалої версії зупиняємо,
+      # а її файли відкладаємо в *.failed, щоб наступний деплой не взяв їх за попередню версію.
+      ROLLBACK_SH: |
+        rollback() {
+          echo "$1" >&2
+          if [ -f .env.previous ] && [ -f compose.yaml.previous ]; then
+            cp -p .env.previous .env
+            cp -p compose.yaml.previous compose.yaml
+            docker compose up -d --wait --wait-timeout 120
+            echo 'Відкат на попередню версію виконано' >&2
+          else
+            docker compose down --remove-orphans || true
+            mv -f .env .env.failed
+            mv -f compose.yaml compose.yaml.failed
+            echo 'Попередньої версії немає (перший деплой): відкату не було, стек зупинено, файли в *.failed' >&2
+          fi
+          exit 1
+        }
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: deploy
+
+      - name: Налаштувати SSH (ключ хоста закріплено)
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          : "${DEPLOY_HOST:?vars.DEPLOY_HOST is not set}" "${DEPLOY_USER:?vars.DEPLOY_USER is not set}"
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY"     > ~/.ssh/deploy_key && chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts && chmod 644 ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<EOF
+          Host vm
+            HostName ${DEPLOY_HOST}
+            User ${DEPLOY_USER}
+            IdentityFile ~/.ssh/deploy_key
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            UserKnownHostsFile ~/.ssh/known_hosts
+            BatchMode yes
+            ConnectTimeout 15
+          EOF
+          chmod 600 ~/.ssh/config
+
+      - name: Передати compose.yaml і .env (секрети — через stdin ssh)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SMS_TOKEN: ${{ secrets.SMS_TOKEN }}
+        run: |
+          : "${DATABASE_URL:?secret DATABASE_URL is empty}" "${SMS_TOKEN:?secret SMS_TOKEN is empty}"
+          # Значення в одинарних лапках: інакше compose інтерполює "$" у паролі.
+          for v in "$DATABASE_URL" "$SMS_TOKEN"; do
+            case "$v" in *"'"*|*$'\n'*) echo "secret contains a quote or newline" >&2; exit 1;; esac
+          done
+          # APP_DIR готує адміністратор (див. «Підготовка VM» на початку файлу)
+          ssh vm "install -m 750 -d '$APP_DIR'"
+          ssh vm "cat > '$APP_DIR/compose.yaml.new'" < deploy/compose.yaml
+          printf "IMAGE_REGISTRY='%s'\nIMAGE_TAG='%s'\nDATABASE_URL='%s'\nSMS_TOKEN='%s'\n" \
+            "$IMAGE_REGISTRY" "$IMAGE_TAG" "$DATABASE_URL" "$SMS_TOKEN" \
+            | ssh vm "umask 077 && cat > '$APP_DIR/.env.new'"
+
+      - name: Стягнути образ і перезапустити сервіси (з автовідкатом)
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REGISTRY_USER: ${{ github.actor }}
+        run: |
+          printf '%s' "$REGISTRY_TOKEN" \
+            | ssh vm "docker login ghcr.io -u '$REGISTRY_USER' --password-stdin >/dev/null"
+          ssh vm "set -eu
+            cd '$APP_DIR'
+            trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+            $ROLLBACK_SH
+            # знімок — лише повної попередньої версії; старі *.previous не беремо
+            rm -f .env.previous compose.yaml.previous
+            if [ -f .env ] && [ -f compose.yaml ]; then
+              cp -p .env .env.previous
+              cp -p compose.yaml compose.yaml.previous
+            fi
+            mv .env.new .env
+            mv compose.yaml.new compose.yaml
+            docker compose config --quiet || rollback 'Конфігурація compose невалідна — відкат'
+            docker compose pull || rollback 'Не вдалося стягнути образ — відкат'
+            docker compose up -d --wait --wait-timeout 120 --remove-orphans || rollback 'Деплой не пройшов healthcheck — відкат'
+            docker compose ps"
+
+      # /health не ходить у БД і 14.10 відповідав 200 увесь інцидент. Тому після деплою —
+      # справжній запит через пул БД: POST /pickup з неіснуючим кодом має дати 404 швидко.
+      # 503 або > 1 с — пул/БД не в порядку: відкат.
+      - name: Smoke-тест через БД (з автовідкатом)
+        run: |
+          ssh vm "set -eu
+            cd '$APP_DIR'
+            $ROLLBACK_SH
+            ok=0
+            for i in 1 2 3 4 5; do
+              out=\$(curl -s -o /dev/null -w '%{http_code} %{time_total}' -X POST http://127.0.0.1:8080/pickup \
+                -H 'content-type: application/json' -d '{\"code\":\"000000\"}' || true)
+              echo \"smoke \$i: \$out\"
+              case \"\$out\" in 404\ 0.*) ok=\$((ok + 1));; esac
+              sleep 2
+            done
+            if [ \"\$ok\" -lt 4 ]; then
+              rollback 'Smoke-тест не пройшов — відкат'
+            fi"
+
+      - name: Підсумок
+        if: always()
+        run: |
+          echo "Образ: \`${IMAGE_REGISTRY}/poshtomat:${IMAGE_TAG}\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Прибрати ключ
+        if: always()
+        run: rm -rf ~/.ssh
