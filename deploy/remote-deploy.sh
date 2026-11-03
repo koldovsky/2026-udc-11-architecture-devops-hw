@@ -7,9 +7,11 @@
 #
 # Порядок:
 #   1. перевірити середовище (curl, compose з up --wait-timeout) і compose.yaml.new (config -q,
-#      лише https:// для зовнішніх API), стягнути образ — робочий compose.yaml ще не чіпаємо;
+#      лише https:// для зовнішніх API, DB_POOL_MAX задано числом), стягнути образ — робочий
+#      compose.yaml ще не чіпаємо;
 #   2. зберегти робочий файл як compose.yaml.prev, підмінити, up --wait (api має стати healthy);
-#   3. функціональна перевірка: проба через пул з'єднань api і перший цикл worker без помилок;
+#   3. функціональна перевірка: розмір пулу в api і worker = DB_POOL_MAX, проба через пул api,
+#      перший цикл worker без помилок;
 #   4. лише після успіху записати IMAGE/IMAGE_TAG у .env і рядок у deploys.log.
 # Будь-який збій на кроках 2–3 → повертаємо compose.yaml.prev і образ з .env, вихід ≠ 0.
 set -euo pipefail
@@ -25,16 +27,31 @@ docker compose up --help | grep -q -- --wait-timeout || fail 'docker compose н�
 
 export IMAGE="$new_image" IMAGE_TAG="$new_tag"
 docker compose -f compose.yaml.new config -q
-# app/ схему URL не перевіряє, а SMS_TOKEN іде в заголовку Authorization (app/src/sms.js:33)
-if docker compose -f compose.yaml.new config | grep -Eq '_BASE_URL: .?http://'; then
+# app/ схему URL не перевіряє, а SMS_TOKEN іде в заголовку Authorization (app/src/sms.js:33).
+# Дозволено лише https:// (у будь-якому регістрі); http://, HTTP:// чи інша схема — стоп.
+if docker compose -f compose.yaml.new config | grep '_BASE_URL: ' | grep -Eqiv '_BASE_URL: .?https://'; then
   fail 'SMS_BASE_URL і COURIER_BASE_URL на проді мають бути https://'
 fi
+# Скільки з'єднань пулу задає compose: з ним після старту звіряємо те, що взяв застосунок.
+want_pool=$(docker compose -f compose.yaml.new config | sed -n 's/^ *DB_POOL_MAX: "\{0,1\}\([0-9][0-9]*\)"\{0,1\} *$/\1/p' | sort -u)
+case "$want_pool" in
+  '' | *[!0-9]*) fail "DB_POOL_MAX у compose.yaml.new не задано одним числом для всіх сервісів: '${want_pool//$'\n'/ }'" ;;
+esac
+want_pool=$((10#$want_pool))
 docker compose -f compose.yaml.new pull --quiet api worker
 
 # Функціональна перевірка нового релізу. HEALTHCHECK (/health) пулу не торкається, тож healthy
 # ще не означає, що API обслуговує запити (docs/rca.md, доказ 15).
 smoke() {
-  local i code id
+  local i code id svc got
+  # Ефективний розмір пулу в процесі = DB_POOL_MAX з compose. Інакше застосунок не прочитав змінну
+  # і взяв дефолт 4 (саме так було 14.10) — проби нижче цього б не помітили, бо одне з'єднання є.
+  for svc in api worker; do
+    got=$(docker compose exec -T "$svc" node --input-type=module \
+      -e 'import { loadConfig } from "./src/config.js"; console.log(loadConfig().dbPoolMax)') || got='?'
+    [ "$got" = "$want_pool" ] ||
+      { echo "deploy: $svc — пул $got з'єднань, а DB_POOL_MAX у compose — $want_pool" >&2; return 1; }
+  done
   # api: фальшивий токен → пошук сесії через пул з'єднань → 403 менш ніж за 3 с. 503 чи таймаут —
   # пул не видає з'єднань (як 14.10). Це проба пулу, а не PostgreSQL: у репо сховище в пам'яті.
   for i in 1 2 3 4 5; do
