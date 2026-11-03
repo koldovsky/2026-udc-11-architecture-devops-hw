@@ -98,9 +98,10 @@ jobs:
           candidate="/opt/poshtomat/compose.yaml.$DEPLOY_RUN_NUMBER"
           scp deploy/compose.yaml "$target:$candidate"
           remote_script=$(cat <<'REMOTE'
+          trap 'rm -f -- "$COMPOSE_CANDIDATE"' EXIT
           IFS= read -r ghcr_token || exit 2
           exec 9>/opt/poshtomat/.deploy.lock
-          flock -x 9
+          flock -x 9 || exit 2
           last_run=0
           if [ -f /opt/poshtomat/.last-deploy-run ]; then
             read -r last_run </opt/poshtomat/.last-deploy-run || exit 2
@@ -111,6 +112,13 @@ jobs:
             echo "Skipping stale deployment run $DEPLOY_RUN_NUMBER; run $last_run was already accepted" >&2
             exit 0
           fi
+          printf '%s\n' "$DEPLOY_RUN_NUMBER" > /opt/poshtomat/.last-deploy-run.tmp
+          marker_status=$?
+          if [ "$marker_status" -eq 0 ]; then
+            mv /opt/poshtomat/.last-deploy-run.tmp /opt/poshtomat/.last-deploy-run
+            marker_status=$?
+          fi
+          if [ "$marker_status" -ne 0 ]; then exit "$marker_status"; fi
           mv "$COMPOSE_CANDIDATE" /opt/poshtomat/compose.yaml || exit 2
           printf '%s' "$ghcr_token" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
           deploy_status=$?
@@ -121,15 +129,6 @@ jobs:
           if [ "$deploy_status" -eq 0 ]; then
             docker compose -f /opt/poshtomat/compose.yaml up -d --remove-orphans --wait --wait-timeout 60
             deploy_status=$?
-          fi
-          if [ "$deploy_status" -eq 0 ]; then
-            printf '%s\n' "$DEPLOY_RUN_NUMBER" > /opt/poshtomat/.last-deploy-run.tmp
-            marker_status=$?
-            if [ "$marker_status" -eq 0 ]; then
-              mv /opt/poshtomat/.last-deploy-run.tmp /opt/poshtomat/.last-deploy-run
-              marker_status=$?
-            fi
-            if [ "$marker_status" -ne 0 ]; then deploy_status=$marker_status; fi
           fi
           docker logout ghcr.io
           logout_status=$?
