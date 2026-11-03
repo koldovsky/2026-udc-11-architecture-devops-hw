@@ -564,7 +564,7 @@ export const RULES = [
     // контракт: множина ключів environment сервісу = множина env.* у config.js.
     id: "C5",
     title: `Ключі environment сервісів застосунку збігаються з env.* у ${CONFIG_SOURCE}`,
-    hint: `Кожен ключ environment у ${PATHS.compose} має читатися в ${CONFIG_SOURCE} як env.<KEY>, і кожна змінна, яку читає ${CONFIG_SOURCE}, має бути задана в кожному сервісі застосунку — інакше вона тихо візьме дефолт із коду. Перейменували змінну — перейменуйте на обох боках. Змінні, які споживає не застосунок, а платформа (${[...PLATFORM_ENV].join(", ")}), правило не вимагає і не забороняє; сервіс, що не задає жодної змінної застосунку (БД, кеш, бекап), правило не чіпає.`,
+    hint: `Кожен ключ environment у ${PATHS.compose} має читатися в ${CONFIG_SOURCE} як env.<KEY>, і кожна змінна, яку читає ${CONFIG_SOURCE}, має бути задана в кожному сервісі застосунку — інакше вона тихо візьме дефолт із коду. Перейменували змінну — перейменуйте на обох боках. Змінні, які споживає не застосунок, а платформа (${[...PLATFORM_ENV].join(", ")}), правило не вимагає і не забороняє. Сервісом застосунку вважається той, що задає хоч одну таку змінну, або той, що запускає той самий образ, що й він: сервіс застосунку без жодної змінної — це FAIL, а не привід його пропустити. Сервіс зі своїм образом і своїми змінними (БД, кеш, бекап) правило не чіпає.`,
     check(ctx) {
       const problem = composeProblem(ctx.compose);
       if (problem) return problem;
@@ -574,11 +574,19 @@ export const RULES = [
       if (!read.size) return skip(`у ${CONFIG_SOURCE} немає читань env.*`);
       const problems = [];
       const checked = [];
-      for (const [name, svc] of services(ctx.compose)) {
+      const all = services(ctx.compose);
+      // Сервіс належить застосунку, якщо задає хоч одну змінну, яку той читає, —
+      // PostgreSQL чи бекап зі своїм POSTGRES_PASSWORD сюда не потрапляє. Але самих
+      // ключів для відбору недостатньо: сервіс, у якого environment зник цілком,
+      // не задає жодної змінної й тихо випав би з перевірки — саме в тому стані, який
+      // правило й шукає. Тому до застосунку зараховуємо і сервіси того самого образу.
+      const named = all.filter(([, svc]) => envEntries(svc?.environment).some(([key]) => read.has(key)));
+      const namedServices = new Set(named.map(([name]) => name));
+      const appImages = new Set(named.map(([, svc]) => svc?.image).filter((image) => typeof image === "string" && image !== ""));
+      const isApp = (name, svc) => namedServices.has(name) || (typeof svc?.image === "string" && appImages.has(svc.image));
+      for (const [name, svc] of all) {
+        if (!isApp(name, svc)) continue;
         const keys = envEntries(svc?.environment).map(([key]) => key);
-        // Сервіс належить застосунку, якщо задає хоч одну змінну, яку той читає:
-        // PostgreSQL чи бекап зі своїм POSTGRES_PASSWORD сюда не потрапляє.
-        if (!keys.some((key) => read.has(key))) continue;
         checked.push(name);
         const unread = keys.filter((key) => !read.has(key) && !PLATFORM_ENV.has(key));
         const missing = [...read].filter((key) => !keys.includes(key));

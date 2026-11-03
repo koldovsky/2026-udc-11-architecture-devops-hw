@@ -116,6 +116,11 @@ jobs:
     name: production
     needs: build
     runs-on: ubuntu-latest
+    # Прод — лише з main. `workflow_dispatch` можна запустити з будь-якої гілки, тому
+    # ручний запуск із feature-гілки інакше випустив би в прод образ, якого в main
+    # немає. Required reviewers в environment production — додатковий, а не цей захист:
+    # у цьому файлі його не видно, тож умова мусить бути тут.
+    if: github.ref == 'refs/heads/main'
     # Ручне погодження: GitHub тримає job у стані "Waiting", поки required
     # reviewers цього environment не натиснуть Approve. Налаштовується
     # в Settings → Environments → production → Required reviewers.
@@ -124,6 +129,7 @@ jobs:
       url: https://poshtomat.example.org
     permissions:
       contents: read
+      packages: read # GITHUB_TOKEN іде на VM як REGISTRY_TOKEN: логін у GHCR і docker pull
     steps:
       - uses: actions/checkout@v5
         with:
@@ -209,9 +215,19 @@ jobs:
 
           write_image "$IMAGE"
 
-          # --wait: compose сам чекає, поки api стане healthy за GET /health.
+          # Успіхом вважаємо лише обидві перевірки: compose дочекався healthy
+          # (--wait за GET /health) і health відповідає зовні контейнера. Якщо
+          # завалилася будь-яка з них — спільний шлях відкату нижче.
+          rollout_ok=""
           if docker compose up -d --remove-orphans --wait --wait-timeout 120; then
-            curl -fsS --max-time 10 http://127.0.0.1:8080/health
+            if curl -fsS --max-time 10 http://127.0.0.1:8080/health; then
+              rollout_ok=yes
+            else
+              echo "::warning::compose reported healthy, but GET /health failed" >&2
+            fi
+          fi
+
+          if [ -n "$rollout_ok" ]; then
             echo
             echo "deployed $IMAGE"
             docker image prune -f --filter 'until=168h' >/dev/null || true

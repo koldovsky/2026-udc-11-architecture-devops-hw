@@ -207,6 +207,14 @@ test("C5: compose environment keys are exactly what app/src/config.js reads", (t
   // a typo added next to the right key: nothing is missing, but one key is dead weight
   assert.equal(C5(app({ DB_POOL_MAXX: "20" })), "FAIL");
 
+  // the whole environment block gone from a service of the same image: FAIL, not skipped.
+  // Selecting app services by their keys alone would let exactly this state through.
+  const noEnv = svc();
+  assert.equal(C5(app(), noEnv), "FAIL");
+  assert.match(message(app(), noEnv), /s2: не задано DATABASE_URL, DB_POOL_MAX, SMS_TOKEN/);
+  // ...while a foreign image without environment stays out of the rule
+  assert.equal(C5(app(), svc({ image: "postgres:16.4-alpine" })), "PASS");
+
   // without the other side of the contract there is nothing to compare: SKIP, not FAIL
   writeFileSync(configFile, "export const loadConfig = () => ({ port: 8080 });\n");
   assert.equal(C5(app()), "SKIP");

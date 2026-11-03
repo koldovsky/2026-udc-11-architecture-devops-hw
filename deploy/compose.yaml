@@ -26,6 +26,15 @@ x-env: &env
   NODE_ENV: "production"
   PORT: "8080"
   LOG_LEVEL: ${LOG_LEVEL:-info}
+  # УВАГА — стан репозиторію, не продакшну. DATABASE_URL тут заданий, але код його
+  # лише читає й нікуди не передає: `createPool` щоразу створює власне сховище в
+  # пам'яті (`app/src/db.js:63`), і жоден із трьох входів не передає `store`
+  # (`app/src/server.js:91`, `app/src/worker.js:43`, `app/bin/expire-parcels.js:24`).
+  # Тобто як є api, worker і expire працюють із трьома окремими сховищами, а не зі
+  # спільним PostgreSQL — див. `docs/architecture.md`, «Рівень 2». У продакшні той
+  # самий інтерфейс має працювати поверх PostgreSQL (`app/README.md:23-24`), але цього
+  # шару в репозиторії немає. Перед розгортанням цього файла з реальними даними
+  # спершу зробіть його і перевірте, що всі три входи бачать одні й ті самі посилки.
   DATABASE_URL: "${DATABASE_URL:?DATABASE_URL must be set in the .env next to this file}"
   DB_POOL_MAX: ${DB_POOL_MAX:-20}
   DB_POOL_WAIT_MS: ${DB_POOL_WAIT_MS:-2000}
