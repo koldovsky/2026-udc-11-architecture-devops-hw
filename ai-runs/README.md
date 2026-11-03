@@ -11,11 +11,11 @@
 |---|---|---|
 | `adr-without.md` | Task A | питання + `app/` |
 | `adr-with.md` | Task A | те саме + `materials/` і `docs/ops/` |
-| `c4-from-docs.md` | Task B | `app/README.md` + `app/docs/` |
+| `c4-from-docs.md` | Task B | `app/README.md` + `app/docs/ARCHITECTURE.md` |
 | `c4-from-code.md` | Task B | уся `app/` |
 | `rca-v1.md` | Task C | `incident/alerts.json` + `incident/logs/` + `incident/metrics/` |
 | `rca-v2.md` | Task C | уся тека `incident/` + `app/` + `deploy/` |
-| `check-deploy-v1.txt` | Task D | вивід `node tools/check-deploy.mjs` на першій чернетці AI |
+| `check-deploy-v1.txt` | Task D | stdout перевірки першої чернетки з окремої ізольованої сесії |
 
 Зберігайте як `.md` або `.txt` — файли `*.log` git ігнорує. Вивід перевірки зберігайте
 командою `node tools/check-deploy.mjs > ai-runs/check-deploy-v1.txt`, а не через
@@ -42,3 +42,9 @@
 Якщо агент усе ж записав відповідь у файл — збережіть вміст цього файлу (і його фінальне
 повідомлення в чаті). Якщо замість відповіді він поставив питання — відповідайте лише
 «вирішуй сам» і збережіть обидва його повідомлення.
+
+## Стан прогонів
+
+Результати Task A–C збережені з окремих нових сесій; у шапках кожного файла вказані
+вхідні дані та дослівний промпт. Для Task D тут збережений stdout перевірки першої
+чернетки, отриманої в окремій ізольованій сесії.

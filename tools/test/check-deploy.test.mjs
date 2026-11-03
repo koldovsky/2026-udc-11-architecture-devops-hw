@@ -92,6 +92,31 @@ test("D4: no secret-like ENV or ARG with a value baked into the image", () => {
   assert.equal(status("D4", ctx({ dockerfile: "FROM a:1\nENV PGPASSWORD=CHANGE_ME\n" })), "FAIL"); // no underscore before PASSWORD
 });
 
+test("D5: database pool variables in compose match the key read by the application", () => {
+  const appConfig = { exists: true, text: "const dbPoolMax = Number(env.DB_POOL_MAX) || 4;" };
+  const composeWith = (environment) => ctx({ compose: compose(svc({ environment: { DATABASE_URL: "postgres://db/app", ...environment } })) });
+  const composeWithoutDatabaseUrl = (environment) => ctx({ compose: compose(svc({ environment })) });
+  const bad = composeWith({ DB_POOL_SIZE: "20" }); // incident: Compose used a key the app ignored
+  assert.equal(status("D5", { ...bad, appConfig }), "FAIL");
+
+  const good = composeWith({ DB_POOL_MAX: "20" }); // correct key and value; default is not used
+  assert.equal(status("D5", { ...good, appConfig }), "PASS");
+  assert.equal(status("D5", { ...composeWith({ DB_POOL_MAX: "" }), appConfig }), "FAIL");
+  assert.equal(status("D5", { ...composeWith({ DB_POOL_MAX: null }), appConfig }), "FAIL");
+  assert.equal(status("D5", { ...composeWith({ DB_POOL_MAX: "0" }), appConfig }), "FAIL");
+  assert.equal(status("D5", { ...composeWith({ DB_POOL_MAX: "twenty" }), appConfig }), "FAIL");
+  assert.equal(status("D5", { ...composeWith({ DB_POOL_MAX: "${DB_POOL_MAX:-}" }), appConfig }), "FAIL");
+  assert.equal(status("D5", { ...composeWith({ DB_POOL_MAX: "${DB_POOL_MAX:?required}" }), appConfig }), "PASS");
+  assert.equal(status("D5", { ...composeWith({ DB_POOL_MAX: "${DB_POOL_MAX:-20}" }), appConfig }), "PASS");
+  assert.equal(status("D5", { ...composeWithoutDatabaseUrl({ DB_POOL_MAX: "20" }), appConfig }), "PASS");
+  assert.equal(status("D5", { ...composeWithoutDatabaseUrl({ DB_POOL_SIZE: "20" }), appConfig }), "FAIL");
+  assert.equal(status("D5", { ...composeWithoutDatabaseUrl({ DB_POOL_MAX: null }), appConfig }), "FAIL");
+
+  const extraUnsupported = composeWith({ DB_POOL_MAX: "20", DB_POOL_SIZE: "20" });
+  assert.equal(status("D5", { ...extraUnsupported, appConfig }), "FAIL");
+  assert.equal(status("D5", { ...good, appConfig: { exists: false } }), "FAIL");
+});
+
 test("C1: compose images are pinned", () => {
   assert.equal(status("C1", ctx({ compose: compose(svc(), svc({ image: "registry.example.org/web:${IMAGE_TAG:?set it}" })) })), "PASS");
   assert.equal(status("C1", ctx({ compose: compose(svc({ image: `web@sha256:${"b".repeat(64)}` })) })), "PASS");
@@ -273,7 +298,7 @@ test("when npx cannot run, the YAML rules say so instead of blaming the files", 
     const results = runChecks(loadContext(dir, { parse: offline }));
     assert.equal(calls, 1, "after the first failure npx is not tried again");
     const by = Object.fromEntries(results.map((r) => [r.id, r]));
-    for (const id of ["D3", "C1", "C2", "C3", "C4", "W1"]) {
+    for (const id of ["D3", "D5", "C1", "C2", "C3", "C4", "W1"]) {
       assert.equal(by[id].status, "FAIL", id);
       assert.equal(by[id].toolError, true, id);
       assert.match(by[id].message, /не вдалося запустити npx yaml@2\.8\.1 — перший запуск потребує мережі \(npm error code ENOTCACHED\)/, id);
@@ -329,7 +354,7 @@ test("the CLI prints a row per rule, survives broken YAML and exits 1 on failure
     assert.equal(code, 1);
     const rows = Object.fromEntries(out.split("\n").filter((l) => /^[DCW]\d /.test(l)).map((l) => [l.slice(0, 2), l.slice(4, 8)]));
     assert.deepEqual(rows, {
-      D1: "PASS", D2: "PASS", D3: "FAIL", D4: "PASS",
+      D1: "PASS", D2: "PASS", D3: "FAIL", D4: "PASS", D5: "FAIL",
       C1: "PASS", C2: "PASS", C3: "PASS", C4: "PASS",
       W1: "FAIL", W2: "SKIP", W3: "SKIP", W4: "SKIP", W5: "SKIP",
     });
