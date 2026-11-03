@@ -107,13 +107,11 @@ jobs:
           fi
           case "$DEPLOY_RUN_NUMBER" in ''|*[!0-9]*) exit 2 ;; esac
           case "$last_run" in ''|*[!0-9]*) exit 2 ;; esac
-          if [ "$DEPLOY_RUN_NUMBER" -le "$last_run" ]; then
+          if [ "$DEPLOY_RUN_NUMBER" -lt "$last_run" ]; then
             echo "Skipping stale deployment run $DEPLOY_RUN_NUMBER; run $last_run was already accepted" >&2
             exit 0
           fi
-          printf '%s\n' "$DEPLOY_RUN_NUMBER" > /opt/poshtomat/.last-deploy-run.tmp || exit 2
-          mv /opt/poshtomat/.last-deploy-run.tmp /opt/poshtomat/.last-deploy-run || exit 2
-          mv "$COMPOSE_CANDIDATE" /opt/poshtomat/compose.yaml
+          mv "$COMPOSE_CANDIDATE" /opt/poshtomat/compose.yaml || exit 2
           printf '%s' "$ghcr_token" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
           deploy_status=$?
           if [ "$deploy_status" -eq 0 ]; then
@@ -123,6 +121,15 @@ jobs:
           if [ "$deploy_status" -eq 0 ]; then
             docker compose -f /opt/poshtomat/compose.yaml up -d --remove-orphans --wait --wait-timeout 60
             deploy_status=$?
+          fi
+          if [ "$deploy_status" -eq 0 ]; then
+            printf '%s\n' "$DEPLOY_RUN_NUMBER" > /opt/poshtomat/.last-deploy-run.tmp
+            marker_status=$?
+            if [ "$marker_status" -eq 0 ]; then
+              mv /opt/poshtomat/.last-deploy-run.tmp /opt/poshtomat/.last-deploy-run
+              marker_status=$?
+            fi
+            if [ "$marker_status" -ne 0 ]; then deploy_status=$marker_status; fi
           fi
           docker logout ghcr.io
           logout_status=$?
