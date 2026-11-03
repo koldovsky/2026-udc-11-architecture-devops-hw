@@ -4,7 +4,8 @@
 //   npm run check:deploy                 checks this repo
 //   node tools/check-deploy.mjs --root <dir>   checks another tree with the same layout
 //
-// Files: deploy/Dockerfile, deploy/compose.yaml, pipeline/deploy.yml.
+// Files: deploy/Dockerfile, deploy/compose.yaml, pipeline/deploy.yml; C5 also reads
+// app/src/config.js and app/package.json (which compose services run the app's code).
 // Output: one row per rule (PASS / FAIL / SKIP) and a hint under every FAIL.
 // Exit code 1 when any rule fails.
 //
@@ -23,6 +24,7 @@ export const PATHS = {
   dockerfile: "deploy/Dockerfile",
   compose: "deploy/compose.yaml",
   workflow: "pipeline/deploy.yml",
+  appConfig: "app/src/config.js", // C5: the code that reads the environment
 };
 
 // ---------------------------------------------------------------- parsing
@@ -163,6 +165,11 @@ export function dockerfileSource(text, path = PATHS.dockerfile) {
   return { path, exists: true, text, instructions: parseDockerfile(text) };
 }
 
+export function textFile(root, rel) {
+  const full = join(root, rel);
+  return existsSync(full) ? { path: rel, exists: true, text: readFileSync(full, "utf8") } : { path: rel, exists: false };
+}
+
 function readYamlFile(root, rel, parse) {
   const full = join(root, rel);
   if (!existsSync(full)) return { path: rel, exists: false };
@@ -185,6 +192,7 @@ export function loadContext(root, { parse = parseYaml } = {}) {
     dockerfile: dockerfileSource(existsSync(dockerPath) ? readFileSync(dockerPath, "utf8") : null),
     compose: readYamlFile(root, PATHS.compose, guarded),
     workflow: readYamlFile(root, PATHS.workflow, guarded),
+    appConfig: textFile(root, PATHS.appConfig),
   };
 }
 
@@ -367,6 +375,187 @@ export function imageProblem(image) {
   return null;
 }
 
+// A string literal's place in scanJs().code: \u0001<index into strings>\u0001.
+const LITERAL = /\u0001(\d+)\u0001/;
+
+/**
+ * A `/` starts a regex literal (not a division) at the start, after an operator, an opening bracket,
+ * a keyword or the `)` that closes the condition of an if, while or for.
+ */
+function regexCanStart(code) {
+  const before = code.trimEnd();
+  if (before.endsWith(")")) return closesCondition(before);
+  return before === "" || /(?:[(,=:[!&|?{};+\-*%<>~^]|\b(?:return|typeof|case|do|else|in|of|new|delete|void|throw|instanceof|yield|await))$/.test(before.slice(-12));
+}
+
+/** `code` ends with `)`: does it close the condition of an if, while or for? In `(a + b) / 2` it does not. */
+function closesCondition(code) {
+  let depth = 0;
+  for (let i = code.length - 1; i >= 0; i -= 1) {
+    if (code[i] === ")") depth += 1;
+    else if (code[i] === "(" && (depth -= 1) === 0) return /\b(?:if|while|for)\s*$/.test(code.slice(0, i));
+  }
+  return false;
+}
+
+/**
+ * A small JS scanner for C5: comments and regex literals dropped, every string literal moved
+ * out of the code into `strings` (its place marked by LITERAL), the expressions of template
+ * literals kept as code. So `// env.OLD`, "http://…", /^https?:\/\// and log("env.X …") are
+ * not mistaken for reads, and a quote inside a regex does not derail the strings after it.
+ */
+function scanJs(source) {
+  const s = String(source);
+  const strings = [];
+  const templates = []; // brace depth at each open `${`
+  let code = "";
+  let depth = 0;
+  let i = 0;
+  while (i < s.length) {
+    const c = s[i];
+    if (c === "/" && s[i + 1] === "/") {
+      while (i < s.length && s[i] !== "\n") i += 1;
+    } else if (c === "/" && s[i + 1] === "*") {
+      const end = s.indexOf("*/", i + 2);
+      i = end === -1 ? s.length : end + 2;
+      code += " ";
+    } else if (c === "/" && regexCanStart(code)) {
+      let j = i + 1;
+      let inClass = false; // a `/` inside [...] does not end the regex
+      while (j < s.length && s[j] !== "\n" && (inClass || s[j] !== "/")) {
+        if (s[j] === "\\") j += 1;
+        else if (s[j] === "[") inClass = true;
+        else if (s[j] === "]") inClass = false;
+        j += 1;
+      }
+      j += 1;
+      while (j < s.length && /[A-Za-z]/.test(s[j])) j += 1; // flags
+      code += "/r/";
+      i = j;
+    } else if (c === '"' || c === "'" || c === "`" || (c === "}" && templates.at(-1) === depth)) {
+      if (c === "}") templates.pop();
+      const quote = c === "}" ? "`" : c;
+      let j = i + 1;
+      let text = "";
+      while (j < s.length && s[j] !== quote && !(quote === "`" && s[j] === "$" && s[j + 1] === "{")) {
+        text += s[j] === "\\" ? (s[(j += 1)] ?? "") : s[j];
+        j += 1;
+      }
+      code += `\u0001${strings.push(text) - 1}\u0001`;
+      if (quote === "`" && s[j] === "$") {
+        templates.push(depth);
+        i = j + 2;
+      } else i = j + 1;
+    } else {
+      if (c === "{") depth += 1;
+      else if (c === "}") depth -= 1;
+      code += c;
+      i += 1;
+    }
+  }
+  return { code, strings };
+}
+
+const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/**
+ * Names the code reads from the environment (`env` or `process.env`):
+ *   env.NAME, env?.NAME, env["NAME"], const { NAME, OTHER: x = 1 } = env,
+ *   "NAME" in env, Object.hasOwn(env, "NAME"), Reflect.has(env, "NAME"), env.hasOwnProperty("NAME");
+ * and, when the code also indexes env with a variable or an expression (a helper like
+ * need("NAME")), every string literal that is a whole UPPER_CASE name.
+ */
+export function envNamesRead(source) {
+  const { code, strings } = scanJs(source);
+  const literal = (token) => strings[Number(LITERAL.exec(token)?.[1])] ?? token;
+  const names = new Set();
+  const ENV = String.raw`(?:process\s*\.\s*)?env\b`;
+  const STR = "(\u0001\\d+\u0001)";
+  // env.NAME / process.env.NAME only: not settings.env.NAME or settings . env.NAME (someone else's object), not
+  // this.#env.NAME (a private field), not env.method(); the last dot of a spread (...env.NAME) is no member access.
+  // The same for env["NAME"] and env.hasOwnProperty("NAME") below.
+  for (const m of code.matchAll(/(?<![\w$#])(?<!(?<!\.)\.\s*)(?:process\s*\.\s*)?env\s*(?:\?\.|\.)\s*([A-Za-z_][A-Za-z0-9_]*)(?![A-Za-z0-9_]|\s*\()/g)) names.add(m[1]);
+  for (const re of [
+    new RegExp(String.raw`(?<![\w$#])(?<!(?<!\.)\.\s*)(?:process\s*\.\s*)?env\s*(?:\?\.)?\[[\s(]*${STR}[\s)]*\]`, "g"),
+    new RegExp(String.raw`${STR}\s+in\s+${ENV}`, "g"),
+    new RegExp(String.raw`\b(?:Object\s*\.\s*hasOwn|Reflect\s*\.\s*has)\s*\(\s*${ENV}\s*,\s*${STR}`, "g"),
+    new RegExp(String.raw`(?<![\w$#])(?<!(?<!\.)\.\s*)(?:process\s*\.\s*)?env\s*\.\s*hasOwnProperty\s*\(\s*${STR}`, "g"),
+  ]) {
+    for (const m of code.matchAll(re)) if (ENV_NAME.test(literal(m[1]))) names.add(literal(m[1]));
+  }
+  for (const m of code.matchAll(/\{([^{}]*)\}\s*=\s*(?:process\s*\.\s*)?env\b/g)) {
+    for (const part of m[1].split(",")) {
+      const key = literal(part.split(/[:=]/)[0].trim());
+      if (!key.startsWith("...") && ENV_NAME.test(key)) names.add(key);
+    }
+  }
+  // env indexed by anything but one string literal: env[name], env[(name)], env["DB_" + name], env[`${p}_URL`];
+  // env / process.env only, as above: not settings.env[name] or this.#env[name]
+  if (/(?<![\w$#])(?<!(?<!\.)\.\s*)(?:process\s*\.\s*)?env\s*(?:\?\.)?\[(?![\s(]*\u0001\d+\u0001[\s)]*\])/.test(code)) {
+    for (const text of strings) if (/^[A-Z][A-Z0-9_]*$/.test(text)) names.add(text);
+  }
+  names.delete("");
+  return names;
+}
+
+// Read by the Node runtime / libuv itself, or by convention (NODE_ENV) — not by config.js.
+export const RUNTIME_ENV = new Set(["TZ", "NODE_ENV", "NODE_OPTIONS", "NODE_EXTRA_CA_CERTS", "UV_THREADPOOL_SIZE"]);
+
+// The whole image from a variable without a default — how the pipeline passes the release
+// image (${IMAGE:?…}). With a :- default it is a pinned third-party image, not a release.
+const RELEASE_IMAGE = /^\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[A-Za-z_][A-Za-z0-9_]*(?::?\?[^}]*)?\})$/;
+/**
+ * The image without tag or digest, so that every tag of one image compares equal:
+ * `repo:${TAG:?…}` and `${REGISTRY:?…}/repo:1.9` too (the tag is cut at the first colon after
+ * the last /), and Docker Hub's implicit `docker.io/library/` is dropped.
+ */
+function imageName(image) {
+  const s = String(image);
+  if (/^\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[^}]*\})$/.test(s)) return s; // the whole reference from one variable
+  const ref = s.split("@")[0];
+  const colon = ref.indexOf(":", ref.lastIndexOf("/") + 1);
+  return (colon === -1 ? ref : ref.slice(0, colon)).replace(/^(?:(?:index\.)?docker\.io\/)?(?:library\/)?/, "");
+}
+
+function appScripts(root) {
+  try {
+    return JSON.parse(readFileSync(join(root, "app", "package.json"), "utf8")).scripts ?? {};
+  } catch {
+    return {};
+  }
+}
+
+/** Does this command start the app's code: a file of app/, or an npm script of app/package.json? */
+function startsAppCode(svc, root, scripts) {
+  const words = [...asList(svc?.entrypoint), ...asList(svc?.command)]
+    .flatMap((w) => String(w).split(/\s+/))
+    .map((w) => w.replace(/^["']+|["';]+$/g, ""))
+    .filter(Boolean);
+  const appFile = (w) => /\.[cm]?js$/.test(w) && existsSync(join(root, "app", w.replace(/^(?:\.\/|\/app\/)/, "")));
+  if (words.some(appFile)) return true;
+  const npm = words.indexOf("npm");
+  if (npm === -1) return false;
+  const [verb, script] = words.slice(npm + 1).filter((w) => !w.startsWith("-"));
+  return Object.hasOwn(scripts, ["run", "run-script"].includes(verb) ? script : verb);
+}
+
+/**
+ * Which compose services run the code from app/. Certainly ours: built from the repo (build:)
+ * or given the release image from a variable. Only when there is no such service does a
+ * command decide — a file or npm script of app/ — because `npm start` or `src/server.js` on
+ * someone else's image proves nothing. Then also every service on the same image (same name,
+ * any tag) — e.g. the API on the image's default CMD. The rest are third-party images: their
+ * variables are read by someone else's code.
+ */
+function appServices(list, root) {
+  const scripts = appScripts(root);
+  const sure = list.filter(([, svc]) => svc?.build || RELEASE_IMAGE.test(String(svc?.image ?? "")));
+  const certain = sure.length ? sure : list.filter(([, svc]) => startsAppCode(svc, root, scripts));
+  const images = new Set(certain.filter(([, svc]) => svc?.image).map(([, svc]) => imageName(svc.image)));
+  const ours = ([name, svc]) => certain.some(([n]) => n === name) || (Boolean(svc?.image) && images.has(imageName(svc.image)));
+  return { apps: list.filter(ours), others: list.filter((entry) => !ours(entry)) };
+}
+
 const isNoneTest = (t) => (Array.isArray(t) ? String(t[0]).toUpperCase() === "NONE" : typeof t === "string" && t.trim().toUpperCase() === "NONE");
 const healthcheckOff = (hc) => hc?.disable === true || isNoneTest(hc?.test);
 
@@ -530,6 +719,49 @@ export const RULES = [
         }
       }
       return problems.length ? fail(problems.join("; ")) : pass("секретоподібні змінні задано посиланнями");
+    },
+  },
+  {
+    // Post-mortem 2026-10-14, action item #3: v1.8.0 renamed DB_POOL_MAX to DB_POOL_SIZE in compose
+    // only; config.js never saw the new name and silently used its local-dev default (pool of 4).
+    id: "C5",
+    title: "Кожну змінну environment: сервісів застосунку читає app/src/config.js",
+    hint: "Змінну, якої не читає код, застосунок просто не бачить і мовчки бере типове значення (2026-10-14: DB_POOL_SIZE замість DB_POOL_MAX → пул на 4 з'єднання замість 20). Назвіть змінну в compose так, як її читає app/src/config.js, або, якщо змінна нова, додайте її читання в config.js у тому самому PR. Правило розпізнає env.NAME, env?.NAME, env[\"NAME\"], деструктуризацію з env / process.env, \"NAME\" in env, Object.hasOwn(env, \"NAME\") і хелпер на кшталт need(\"NAME\") поруч з env[name]. Без звірки — лише змінні рантайму Node: TZ, NODE_ENV, NODE_OPTIONS, NODE_EXTRA_CA_CERTS, UV_THREADPOOL_SIZE. Сервіс вважається застосунком, якщо має build: або бере образ цілком зі змінної без значення за замовчуванням (${IMAGE:?…}); коли таких немає — якщо запускає файл чи npm-скрипт з app/; а також кожен сервіс на тому самому образі (будь-який тег). Решту (сторонні образи) правило називає, але не звіряє.",
+    check({ compose, root, appConfig = textFile(root, PATHS.appConfig) }) {
+      const problem = composeProblem(compose);
+      if (problem) return problem;
+      if (!appConfig.exists) return fail(`${PATHS.appConfig} не знайдено — немає з чим звірити змінні compose`);
+      const read = envNamesRead(appConfig.text);
+      const { apps, others } = appServices(services(compose), root);
+      if (!apps.length) {
+        return fail("жоден сервіс compose не розпізнано як застосунок з app/ (build:, image: ${IMAGE:?…}, command: з файлом чи npm-скриптом з app/) — немає що звіряти");
+      }
+      const unread = new Map(); // variable → services that set it
+      const malformed = [];
+      let total = 0;
+      for (const [name, svc] of apps) {
+        const environment = svc?.environment;
+        const scalar = (item) => typeof item === "string" || typeof item === "number";
+        if (environment !== undefined && environment !== null && (typeof environment !== "object" || (Array.isArray(environment) && !environment.every(scalar)))) {
+          malformed.push(name);
+          continue;
+        }
+        for (const [key] of envEntries(environment)) {
+          total += 1;
+          if (read.has(key) || RUNTIME_ENV.has(key)) continue;
+          unread.set(key, [...(unread.get(key) ?? []), name]);
+        }
+      }
+      const skipped = others.filter(([, svc]) => svc?.environment).map(([name]) => name);
+      const note = skipped.length ? `; сторонні образи не звірялися: ${skipped.join(", ")}` : "";
+      const problems = [...unread].map(([key, names]) => `${key} (${names.join(", ")})`);
+      if (problems.length || malformed.length) {
+        const parts = [];
+        if (problems.length) parts.push(`${PATHS.appConfig} не читає: ${problems.join("; ")}`);
+        if (malformed.length) parts.push(`environment: не словник і не список: ${malformed.join(", ")}`);
+        return fail(parts.join("; ") + note);
+      }
+      return pass(`${total} змінних у ${apps.map(([name]) => name).join(", ")} — усі читає config.js або рантайм Node${note}`);
     },
   },
   {

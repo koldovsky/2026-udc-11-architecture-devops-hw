@@ -1,0 +1,398 @@
+# Тести → збірка образу → деплой на продакшн-VM після ручного погодження.
+#
+# GitHub запускає workflow лише з .github/workflows/. У цьому репо файл навмисно лежить у
+# pipeline/, щоб не запускатися ні тут, ні у форках; у робочому репо — .github/workflows/deploy.yml.
+#
+# Одноразове налаштування (Settings → Environments → production):
+#   * Required reviewers — хто погоджує деплой. Без цього правила `environment:` нижче
+#     НЕ зупиняє job і деплой піде без погодження.
+#   * Deployment branches and tags — лише main.
+#   * Environment secrets (саме environment, не repository: тоді їх отримує лише job,
+#     який пройшов погодження):
+#       DEPLOY_HOST         адреса VM
+#       DEPLOY_USER         користувач на VM (у групі docker, власник DEPLOY_PATH)
+#       DEPLOY_SSH_KEY      приватний ключ, окремий для деплою
+#       DEPLOY_KNOWN_HOSTS  рядок(и) `ssh-keyscan <host>`, звірені з відбитком ключа VM
+#       SMS_TOKEN           токен SMS-провайдера
+#       DATABASE_URL        рядок підключення до PostgreSQL
+#   * Environment variables (не секрети):
+#       API_BIND_ADDR       127.0.0.1 — якщо перед API reverse proxy на цій же VM;
+#                           0.0.0.0 — лише якщо TLS термінується перед VM (див. compose.yaml)
+#       DEPLOY_SSH_PORT     необов'язково, за замовчуванням 22
+# На VM: Docker Engine з плагіном compose v2 (з підтримкою `up --wait-timeout`).
+#
+# Перехід із ручного деплою (один раз, у будній вечір після 16:00):
+#   1. Запустіть workflow і дочекайтеся, поки job deploy стане на погодження: тести, образ і
+#      його перевірки вже позаду, тож простій почнеться лише з кроку 2.
+#   2. Зупиніть стек, піднятий вручну (`docker compose -f deploy/compose.yaml down` у його
+#      каталозі): інакше новий api не займе порт 8080, а два worker-и шлитимуть SMS удвох.
+#   3. Погодьте деплой. Якщо він провалився — відкочувати ще нема на що (.env.prev з'явиться
+#      після першого успішного), тож поверніть старий стек: `cd /opt/poshtomat && docker
+#      compose down`, далі `docker compose -f deploy/compose.yaml up -d` у старому каталозі.
+#   4. Cron нічної задачі — `cd /opt/poshtomat && docker compose run --rm expire`: образ і
+#      налаштування поточного релізу, без npm і без SMS_TOKEN.
+#   5. Процедури чергового — під новий каталог (docs/runbook.md, «Після переходу на
+#      pipeline»): `dc`, відкат через .env.prev і зупинка сервісу перед відновленням з
+#      бекапу — `cd /opt/poshtomat && docker compose stop api worker` замість кроку 1
+#      «Відновлення» в docs/ops/backup-runbook.md.
+#
+# Деплой — лише з main: environment обмежує гілки, а `if:` у build і deploy дублює це в
+# самому workflow. Pull request до main проганяє лише job test (там і check:deploy).
+# Застарілий запуск (у main уже новіший коміт) не деплоїться: він відкотив би новіший реліз.
+#
+# Оновлення закріплених версій (digest базового образу, SHA дій) — Dependabot:
+# pipeline/dependabot.yml (у робочому репо — .github/dependabot.yml).
+
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request: # лише тести і check:deploy; build і deploy пропускаються (if: нижче)
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      override_deploy_window:
+        description: "Термінове виправлення: дозволити деплой поза вікном (будній пік 12:00–16:00, ніч 02:00–04:00 за Києвом)"
+        type: boolean
+        default: false
+
+# За замовчуванням — жодних прав; кожен job нижче просить лише потрібне.
+permissions: {}
+
+env:
+  # Мажор має збігатися з базовим образом у deploy/Dockerfile (перевіряється в job test).
+  NODE_VERSION: "24"
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          package-manager-cache: false
+
+      - name: Unit tests
+        working-directory: app
+        run: npm test
+
+      # Детерміновані перевірки deploy/ і pipeline/ (tools/check-deploy.mjs), серед них C5:
+      # кожну змінну environment: у compose читає app/src/config.js (інцидент 2026-10-14).
+      # Деплой залежить від цього job через needs:, тож провал зупиняє реліз до збірки.
+      - name: Deploy config checks and their tests
+        run: |
+          # check-deploy.mjs перевіряє pipeline/deploy.yml. У робочому репо цей workflow лежить
+          # у .github/workflows/ — тоді перевіряємо саме ту копію, що виконується, навіть якщо
+          # поруч лишилася стара в pipeline/.
+          if [ -f .github/workflows/deploy.yml ]; then
+            mkdir -p pipeline && cp .github/workflows/deploy.yml pipeline/deploy.yml
+          fi
+          npm run test:tools
+          npm run check:deploy
+
+      - name: Tests and image use the same Node major
+        run: |
+          grep -Eq "^FROM node:${NODE_VERSION}\." deploy/Dockerfile \
+            || { echo "::error file=deploy/Dockerfile::base image is not Node ${NODE_VERSION}, tests ran on a different runtime"; exit 1; }
+
+      - name: Validate compose file
+        env:
+          IMAGE: ghcr.io/example/poshtomat@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          API_BIND_ADDR: 127.0.0.1
+          SMS_TOKEN: placeholder
+          DATABASE_URL: postgres://placeholder@localhost:5432/placeholder
+        run: docker compose -f deploy/compose.yaml config --quiet
+
+  build:
+    needs: test
+    if: github.ref == 'refs/heads/main' # не для pull request і не з інших гілок
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write # push у GHCR
+    outputs:
+      image: ${{ steps.vars.outputs.name }}@${{ steps.build.outputs.digest }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Image name and app version
+        id: vars
+        run: |
+          echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+          echo "version=$(jq -r .version app/package.json)" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ steps.vars.outputs.name }}
+          tags: |
+            type=sha,format=long
+          labels: |
+            org.opencontainers.image.title=poshtomat
+            org.opencontainers.image.version=${{ steps.vars.outputs.version }}
+
+      - id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: app
+          file: deploy/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          provenance: mode=max
+          sbom: true
+
+      # Перевіряємо саме той артефакт (за digest), який піде на VM, і з тими ж
+      # обмеженнями, що в compose.yaml: read-only, без capabilities, не root.
+      - name: Smoke test the pushed image
+        env:
+          IMAGE: ${{ steps.vars.outputs.name }}@${{ steps.build.outputs.digest }}
+          APP_VERSION: ${{ steps.vars.outputs.version }}
+        run: |
+          docker run --detach --name smoke --publish 127.0.0.1:8080:8080 \
+            --init --read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges:true \
+            "$IMAGE"
+          trap 'docker logs smoke; docker rm --force smoke >/dev/null' EXIT
+
+          if [ "$(docker exec smoke id -u)" = 0 ]; then
+            echo "::error::the container runs as root"; exit 1
+          fi
+          body=
+          for _ in $(seq 1 30); do
+            body=$(curl --fail --silent --show-error http://127.0.0.1:8080/health) && break
+            body=
+            sleep 1
+          done
+          [ -n "$body" ] || { echo "::error::/health did not answer within 30 s"; exit 1; }
+          echo "/health: $body"
+          jq --exit-status --arg v "$APP_VERSION" '.status == "ok" and .version == $v' <<<"$body" >/dev/null \
+            || { echo "::error::/health answered, but not with status ok and version $APP_VERSION"; exit 1; }
+
+          # HEALTHCHECK самого образу: за ним `up --wait` на VM вирішує, чи відкочувати реліз,
+          # тож помилку в ньому треба побачити тут, а не на продакшні.
+          for _ in $(seq 1 60); do
+            case "$(docker inspect --format '{{.State.Health.Status}}' smoke)" in
+              healthy) exit 0 ;;
+              unhealthy) echo "::error::the image HEALTHCHECK reports unhealthy"; exit 1 ;;
+            esac
+            sleep 1
+          done
+          echo "::error::the image HEALTHCHECK did not report healthy within 60 s"
+          exit 1
+
+      # Вразливості в образі, для яких уже є виправлення (новіший базовий образ чи пакет):
+      # критичні й високі зупиняють реліз до деплою. Сканується той самий образ за digest,
+      # який smoke-тест щойно витягнув. Свіжий digest базового образу приносить Dependabot.
+      - name: Scan the image for fixable critical and high vulnerabilities
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ steps.vars.outputs.name }}@${{ steps.build.outputs.digest }}
+          version: v0.76.1
+          scanners: vuln
+          ignore-unfixed: true
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # Ручне погодження: job чекає на Required reviewers з налаштувань environment.
+    environment: production
+    # Один деплой за раз; той, що вже йде, не скасовується посередині.
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: read # GITHUB_TOKEN цього job — одноразовий pull образу на VM
+    env:
+      DEPLOY_PATH: /opt/poshtomat
+      IMAGE: ${{ needs.build.outputs.image }}
+    steps:
+      # Коли не деплоїмо (за Києвом). Job стартує лише після погодження, тож перевіряється
+      # саме час деплою:
+      #   * будні 12:00–16:00 — пік. Post-mortem 2026-10-14, #9: v1.8.0 пішов о 14:02 і
+      #     зустрів пік з першої хвилини;
+      #   * щодня 02:00–04:00 — бекап (02:00–02:30 база лише для читання) і нічна задача о
+      #     03:15 (docs/ops/backup-runbook.md): заміна контейнерів не має зустрітися з ними.
+      - name: Deploy window
+        env:
+          OVERRIDE: ${{ inputs.override_deploy_window == true }}
+        run: |
+          day=$(TZ=Europe/Kyiv date +%u)
+          now=$((10#$(TZ=Europe/Kyiv date +%H%M)))
+          why=
+          if [ "$day" -le 5 ] && [ "$now" -ge 1200 ] && [ "$now" -lt 1600 ]; then
+            why="weekdays 12:00–16:00 Kyiv are the peak (post-mortem 2026-10-14, #9)"
+          elif [ "$now" -ge 200 ] && [ "$now" -lt 400 ]; then
+            why="02:00–04:00 Kyiv is the backup and the nightly job (docs/ops/backup-runbook.md)"
+          fi
+          if [ -z "$why" ]; then exit 0; fi
+          if [ "$OVERRIDE" = true ]; then
+            echo "::warning::deploying outside the deploy window: $why (override_deploy_window)"
+          else
+            echo "::error::$why. Re-run later, or for an urgent fix run the workflow manually with override_deploy_window."
+            exit 1
+          fi
+
+      # Два релізи можуть чекати погодження одночасно; погоджений пізніше старіший відкотив би
+      # новіший. Деплоїмо лише коміт, який досі є вершиною main.
+      - name: Still the newest commit on main
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          head=$(gh api "repos/$GITHUB_REPOSITORY/commits/main" --jq .sha)
+          if [ "$head" != "$GITHUB_SHA" ]; then
+            echo "::error::main is at $head now, this run built $GITHUB_SHA: deploying it would roll production back. The run of the newer commit deploys it."
+            exit 1
+          fi
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Configure SSH
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          DEPLOY_SSH_PORT: ${{ vars.DEPLOY_SSH_PORT || '22' }}
+        run: |
+          for name in DEPLOY_HOST DEPLOY_USER DEPLOY_SSH_KEY DEPLOY_KNOWN_HOSTS; do
+            [ -n "${!name}" ] || { echo "::error::secret $name is not set for environment production"; exit 1; }
+          done
+          umask 077
+          mkdir -p "$RUNNER_TEMP/ssh"
+          printf '%s\n' "$DEPLOY_SSH_KEY" > "$RUNNER_TEMP/ssh/key"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$RUNNER_TEMP/ssh/known_hosts"
+          # Ключ хоста звіряється з DEPLOY_KNOWN_HOSTS; невідомий хост — відмова, а не довіра.
+          cat > "$RUNNER_TEMP/ssh/config" <<EOF
+          Host prod
+            HostName $DEPLOY_HOST
+            User $DEPLOY_USER
+            Port $DEPLOY_SSH_PORT
+            IdentityFile $RUNNER_TEMP/ssh/key
+            IdentitiesOnly yes
+            UserKnownHostsFile $RUNNER_TEMP/ssh/known_hosts
+            StrictHostKeyChecking yes
+            BatchMode yes
+            ConnectTimeout 15
+            ServerAliveInterval 15
+          EOF
+
+      - name: Upload compose file and runtime config
+        env:
+          API_BIND_ADDR: ${{ vars.API_BIND_ADDR }}
+          SMS_TOKEN: ${{ secrets.SMS_TOKEN }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          [[ $IMAGE =~ ^ghcr\.io/[a-z0-9._/-]+@sha256:[0-9a-f]{64}$ ]] \
+            || { echo "::error::unexpected image reference from the build job: '$IMAGE'"; exit 1; }
+          for name in API_BIND_ADDR SMS_TOKEN DATABASE_URL; do
+            value=${!name}
+            [ -n "$value" ] || { echo "::error::$name is not set for environment production"; exit 1; }
+            case $value in
+              *"'"* | *$'\n'*) echo "::error::$name must not contain a single quote or a newline"; exit 1 ;;
+            esac
+          done
+
+          ssh -F "$RUNNER_TEMP/ssh/config" prod \
+            "mkdir -p '$DEPLOY_PATH' && cat > '$DEPLOY_PATH/compose.yaml.next'" < deploy/compose.yaml
+
+          # Секрети йдуть через stdin: не в аргументах команд, не в логах. Одинарні лапки —
+          # compose читає значення буквально, без підстановки `$`. Файл створюється з правами 600.
+          {
+            printf "IMAGE='%s'\n" "$IMAGE"
+            printf "API_BIND_ADDR='%s'\n" "$API_BIND_ADDR"
+            printf "SMS_TOKEN='%s'\n" "$SMS_TOKEN"
+            printf "DATABASE_URL='%s'\n" "$DATABASE_URL"
+          } | ssh -F "$RUNNER_TEMP/ssh/config" prod "umask 077 && cat > '$DEPLOY_PATH/.env.next'"
+
+      - name: Pull the image on the VM
+        env:
+          REGISTRY_USER: ${{ github.actor }}
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Короткоживучий GITHUB_TOKEN цього job (лише packages: read) іде через stdin у
+          # тимчасовий DOCKER_CONFIG, який видаляється одразу після pull: на VM не лишається
+          # жодних облікових даних реєстру.
+          printf '%s\n' "$REGISTRY_TOKEN" | ssh -F "$RUNNER_TEMP/ssh/config" prod "
+            set -eu
+            export DOCKER_CONFIG=\"\$(mktemp -d)\"
+            trap 'rm -rf \"\$DOCKER_CONFIG\"' EXIT
+            docker login ghcr.io --username '$REGISTRY_USER' --password-stdin >/dev/null
+            docker pull --quiet '$IMAGE'
+          "
+
+      - name: Start the new release (automatic rollback if unhealthy)
+        run: |
+          ssh -F "$RUNNER_TEMP/ssh/config" prod bash -s -- "$DEPLOY_PATH" <<'REMOTE' \
+            || { echo "::error::the deploy failed: the new release did not become healthy, or the deploy script itself failed; whether it rolled back is in the log above or in deploy-unhealthy.log in the deploy directory on the VM"; exit 1; }
+          set -euo pipefail
+          cd "$1"
+          # Поточний реліз зберігаємо як *.prev — для автоматичного і ручного відкату.
+          if [ -f .env ] && [ -f compose.yaml ]; then
+            cp -p .env .env.prev
+            cp -p compose.yaml compose.yaml.prev
+          fi
+          mv -f compose.yaml.next compose.yaml
+          mv -f .env.next .env
+
+          if docker compose up --detach --wait --wait-timeout 120 --remove-orphans; then
+            docker compose ps
+            exit 0
+          fi
+
+          # До кінця відкату в SSH-сесію нічого не пишемо: якщо її вже розірвано, перший запис
+          # у неї вбив би скрипт (SIGPIPE) ще до відкату. Вивід іде у файл на VM, а в лог CI —
+          # лише після відкату. Файл не відкрився — вивід іде в /dev/null (і помилка відкриття
+          # теж), а відкат усе одно виконується.
+          exec 3>&1 >/dev/null 2>&1
+          log=deploy-unhealthy.log
+          exec >"$log" 2>&1 || log=
+          echo "--- the new release is unhealthy, last logs:" >&2
+          docker compose logs --no-color --tail 100 api worker >&2 || true
+          if [ -f .env.prev ]; then
+            echo "--- rolling back to the previous release" >&2
+            cp -p .env.prev .env
+            cp -p compose.yaml.prev compose.yaml
+            docker compose up --detach --wait --wait-timeout 120 --remove-orphans \
+              && echo "--- rolled back: the previous release is healthy" >&2 \
+              || echo "--- the previous release is not healthy either" >&2
+          else
+            echo "--- no previous release on the VM: nothing to roll back to" >&2
+          fi
+          if [ -n "$log" ]; then
+            cat "$log" >&3
+          else
+            echo "--- could not write deploy-unhealthy.log: no logs from the VM; check docker compose ps there" >&3
+          fi
+          exit 1
+          REMOTE
+          echo "Deployed \`$IMAGE\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Remove SSH material from the runner
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/ssh"

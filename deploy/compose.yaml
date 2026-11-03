@@ -1,35 +1,113 @@
-# Поштомат громади — продакшн на одній VM (docker compose up -d).
-# PostgreSQL працює на самій VM, поза compose.
+# Поштомат громади — продакшн на одній VM. PostgreSQL працює на самій VM, поза compose.
+#
+# Розгортає pipeline/deploy.yml: кладе цей файл і .env (права 600) у каталог на VM і
+# виконує `docker compose up -d --wait`. У .env лежить те, чого не можна тримати в git,
+# і те, що змінюється з кожним релізом:
+#   IMAGE          образ за digest, напр. ghcr.io/org/repo@sha256:…
+#   SMS_TOKEN      токен SMS-провайдера (секрет)
+#   DATABASE_URL   рядок підключення до PostgreSQL (секрет: може містити пароль)
+#   API_BIND_ADDR  адреса на VM, де слухає API: 127.0.0.1 — якщо перед ним reverse proxy
+#                  на цій же VM (типовий випадок); 0.0.0.0 — лише якщо TLS термінується
+#                  перед VM: API передає коди видачі й токени персоналу, а порт, який
+#                  публікує Docker, обходить правила firewall хоста
+# Якщо якоїсь змінної немає, compose відмовиться стартувати, а не підніметься з
+# порожнім токеном чи заглушкою.
+#
+# Відкат на попередній реліз (pipeline зберігає його поруч), у каталозі розгортання:
+#   cp .env.prev .env && cp compose.yaml.prev compose.yaml && docker compose up -d --wait
+# Він працює, лише поки образ попереднього релізу є на VM: облікових даних реєстру на VM
+# немає, а compose сам нічого не тягне. Тож не чистьте образи (`docker image prune -a`).
+#
+# Нічна задача (cron на VM), з каталогу розгортання:
+#   docker compose run --rm expire
+# Сервіс expire — без npm і лише з потрібними задачі змінними (SMS_TOKEN їй не потрібен).
+# Команда з docs/ops/backup-runbook.md — `docker compose run --rm worker npm run expire` —
+# теж працює, поки cron не переведено (pipeline/deploy.yml, «Перехід»): тому worker має й
+# COURIER_BASE_URL, одне значення з expire (якір &courier-url). Після переходу cron його
+# можна прибрати з worker.
+name: poshtomat
+
+# Спільне для всіх процесів. Кожен сервіс нижче додає лише те, що йому справді
+# потрібно: SMS-токен бачить тільки worker, а не API, відкритий у мережу.
+x-common-env: &common-env
+  TZ: "Europe/Kyiv"
+  LOG_LEVEL: "info"
+  DATABASE_URL: "${DATABASE_URL:?DATABASE_URL is required (see .env)}"
+  DB_POOL_MAX: "20"
+  DB_POOL_WAIT_MS: "2000"
+
+x-app: &app
+  image: "${IMAGE:?IMAGE is required (see .env), e.g. ghcr.io/org/repo@sha256:...}"
+  # Образ заздалегідь тягне pipeline (одноразовим токеном). Compose нічого не завантажує:
+  # якщо образу немає, він одразу відмовиться стартувати з «image not found».
+  pull_policy: never
+  restart: unless-stopped
+  init: true # tini як PID 1: пересилає сигнали, прибирає зомбі-процеси
+  read_only: true # код і файлова система контейнера незмінні; писати можна лише в /tmp
+  tmpfs:
+    - /tmp:size=16m
+  cap_drop: [ALL]
+  security_opt:
+    - "no-new-privileges:true"
+  pids_limit: 256
+  logging:
+    driver: json-file
+    options: # без ротації json-file росте, доки не забере весь диск VM
+      max-size: "20m"
+      max-file: "5"
+
 services:
   api:
-    image: poshtomat:latest
-    build:
-      context: ../app
-      dockerfile: ../deploy/Dockerfile
+    <<: *app
+    command: ["node", "src/server.js"]
     ports:
-      - "8080:8080"
+      - "${API_BIND_ADDR:?API_BIND_ADDR is required (see .env)}:8080:8080"
     environment:
-      TZ: "Europe/Kyiv"
+      <<: *common-env
       PORT: "8080"
-      LOG_LEVEL: "info"
-      DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
-      DB_POOL_MAX: "20"
-      DB_POOL_WAIT_MS: "2000"
-      SMS_BASE_URL: "https://sms.example.net/api/v2"
-      SMS_TOKEN: "CHANGE_ME"
-      SMS_RATE_PER_SEC: "20"
-      COURIER_BASE_URL: "https://courier.example.com/api/v1"
+    # Ліміт пам'яті, щоб API не витіснив PostgreSQL на тій самій VM. Стартове значення —
+    # підлаштуйте за `docker stats`.
+    mem_limit: 512m
+    # healthcheck — HEALTHCHECK з образу (deploy/Dockerfile): HTTP /health. Тут його не
+    # перевизначаємо і не вимикаємо: саме за ним `up --wait` вирішує, чи відкочувати реліз.
+    stop_grace_period: 15s
 
   worker:
-    image: poshtomat:latest
+    <<: *app
     command: ["node", "src/worker.js"]
     environment:
-      TZ: "Europe/Kyiv"
-      LOG_LEVEL: "info"
-      DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
-      DB_POOL_MAX: "20"
-      DB_POOL_WAIT_MS: "2000"
+      <<: *common-env
       SMS_BASE_URL: "https://sms.example.net/api/v2"
-      SMS_TOKEN: "CHANGE_ME"
-      SMS_RATE_PER_SEC: "20"
-      COURIER_BASE_URL: "https://courier.example.com/api/v1"
+      SMS_TOKEN: "${SMS_TOKEN:?SMS_TOKEN is required (see .env)}"
+      # Ліміт облікового запису провайдера — 10/с; понад це 429, і повідомлення не
+      # надсилається (materials/vendors/sms-provider.md). 8 — із запасом (post-mortem, #13).
+      SMS_RATE_PER_SEC: "8"
+      # Для нічної задачі, поки cron запускає її в оточенні worker (див. шапку файлу). Без
+      # неї config.js мовчки бере http://localhost:9002, і задача позначає посилку
+      # повернутою, не викликавши кур'єра.
+      COURIER_BASE_URL: &courier-url "https://courier.example.com/api/v1"
+    mem_limit: 256m
+    # HTTP-перевірка з образу тут завжди провалювалася б: worker не слухає порт. Своєї
+    # чесної перевірки без змін у app/ в нього немає: «процес живий» уже означає стан
+    # контейнера (init + restart), а зависання ловить лише heartbeat із самого worker-а
+    # (наступний крок, потребує змін у app/src/worker.js). Перевірка, яка завжди відповідає
+    # «healthy», гірша за її відсутність — як /health, що віддавав 200 під час інциденту.
+    healthcheck:
+      disable: true
+    # Після SIGTERM worker дочікується поточної пачки SMS. Якщо вбити його раніше,
+    # посилки, яким SMS уже пішло, не позначаться як сповіщені, і мешканці отримають
+    # SMS ще раз. 10 с за замовчуванням Docker на це не вистачає.
+    stop_grace_period: 30s
+
+  # Не запускається з `up` (профіль jobs); лише через `docker compose run --rm expire`.
+  expire:
+    <<: *app
+    profiles: ["jobs"]
+    restart: "no"
+    command: ["node", "bin/expire-parcels.js"]
+    healthcheck:
+      disable: true # разова задача без HTTP: її результат — код виходу
+    environment:
+      <<: *common-env
+      COURIER_BASE_URL: *courier-url
+    mem_limit: 256m

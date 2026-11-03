@@ -1,0 +1,23 @@
+# Dependabot для закріплених залежностей деплою. У цьому репо файл навмисно лежить у
+# pipeline/, як і deploy.yml, щоб нічого не вмикати в репо курсу; у робочому репо —
+# .github/dependabot.yml, поруч з .github/workflows/deploy.yml.
+#
+# Закріплення (digest базового образу, SHA кожного uses:) робить збірку відтворюваною, але
+# саме по собі заморожує й вразливості. Dependabot щотижня пропонує PR з новим digest / SHA;
+# PR проходить ті самі тести, check:deploy і (після злиття) сканування образу в
+# pipeline/deploy.yml.
+version: 2
+updates:
+  - package-ecosystem: docker
+    directory: /deploy # deploy/Dockerfile: FROM node:<версія>@sha256:<digest>
+    schedule:
+      interval: weekly
+    ignore:
+      # Мажор Node — свідоме рішення разом з NODE_VERSION у workflow (job test їх звіряє).
+      - dependency-name: node
+        update-types: ["version-update:semver-major"]
+
+  - package-ecosystem: github-actions
+    directory: / # .github/workflows/
+    schedule:
+      interval: weekly

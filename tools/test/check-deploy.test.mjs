@@ -4,13 +4,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
   classifyYamlFailure,
   dockerfileSource,
+  envNamesRead,
   formatReport,
   isSecretLike,
   isSecretReference,
@@ -21,6 +22,7 @@ import {
 } from "../check-deploy.mjs";
 
 const CHECKER = fileURLToPath(new URL("../check-deploy.mjs", import.meta.url));
+const REPO = fileURLToPath(new URL("../..", import.meta.url));
 
 function ctx({ dockerfile = null, compose, workflow } = {}) {
   return {
@@ -133,6 +135,253 @@ test("C4: secret-like compose variables come only by reference", () => {
   assert.equal(status("C4", ctx({ compose: compose(svc({ environment: ["API_TOKEN=CHANGE_ME"] })) })), "FAIL");
   assert.equal(status("C4", ctx({ compose: compose(svc({ environment: { API_TOKEN: "${API_TOKEN:-CHANGE_ME}" } })) })), "FAIL");
   assert.equal(status("C4", ctx({ compose: compose(svc({ environment: { PGPASSWORD: "CHANGE_ME" } })) })), "FAIL");
+});
+
+// C5 — post-mortem 2026-10-14, action item #3. Shaped like app/src/config.js.
+const CONFIG_JS = [
+  "export function loadConfig(env = process.env) {",
+  "  return {",
+  "    port: Number(env.PORT) || 8080,",
+  '    dbUrl: env.DATABASE_URL || "postgres://poshtomat@localhost:5432/poshtomat",',
+  "    dbPoolMax: Number(env.DB_POOL_MAX) || 4,",
+  '    smsBaseUrl: env["SMS_BASE_URL"] || "http://localhost:9001",',
+  '    smsToken: env.SMS_TOKEN || "",',
+  "  };",
+  "}",
+  "",
+].join("\n");
+
+function c5(composeData, { text = CONFIG_JS, root = REPO } = {}) {
+  const rule = RULES.find((r) => r.id === "C5");
+  const appConfig = text === null ? { exists: false } : { exists: true, text };
+  return rule.check({ ...ctx({ compose: composeData }), root, appConfig });
+}
+
+// how the pipeline passes our image: whole, by digest, from a required variable
+const appSvc = (environment, extra = {}) => ({ image: "${IMAGE:?set IMAGE}", restart: "unless-stopped", environment, ...extra });
+const DB = { DATABASE_URL: "${DATABASE_URL:?missing}" };
+
+test("C5: the v1.8.0 rename (DB_POOL_MAX → DB_POOL_SIZE in compose only) fails, naming the variable and the services", () => {
+  const incident = {
+    services: {
+      api: appSvc({ ...DB, DB_POOL_SIZE: "20", PORT: "8080" }, { command: ["node", "src/server.js"], ports: ["8080:8080"] }),
+      worker: appSvc({ ...DB, DB_POOL_SIZE: "20", SMS_TOKEN: "${SMS_TOKEN:?missing}" }, { command: ["node", "src/worker.js"] }),
+    },
+  };
+  const result = c5(incident);
+  assert.equal(result.status, "FAIL");
+  assert.match(result.message, /DB_POOL_SIZE \(api, worker\)/);
+  assert.doesNotMatch(result.message, /DATABASE_URL|PORT|SMS_TOKEN/); // only the unread name is reported
+});
+
+test("C5: a correct config that a naive rule would trip over passes", () => {
+  const good = {
+    services: {
+      // TZ and NODE_EXTRA_CA_CERTS are read by Node itself, not by config.js
+      api: appSvc(
+        { TZ: "Europe/Kyiv", NODE_EXTRA_CA_CERTS: "/etc/ssl/certs/ca.pem", ...DB, DB_POOL_MAX: "20", PORT: "8080" },
+        { command: ["node", "src/server.js"], ports: ["8080:8080"] },
+      ),
+      // list form; SMS_TOKEN is a ${…:?} reference (C4 demands it): only the name is checked, never the value;
+      // a bare name passes the value through from the shell; env["SMS_BASE_URL"] counts as reading it
+      worker: appSvc(["TZ=Europe/Kyiv", "DB_POOL_MAX=20", "SMS_TOKEN=${SMS_TOKEN:?missing}", "SMS_BASE_URL"], { command: "node src/worker.js" }),
+      // third-party images in the same compose — one pinned through a variable with a default:
+      // their variables are read by the proxy / the database, not by config.js
+      proxy: { image: "caddy:2.8.4-alpine", restart: "unless-stopped", ports: ["443:443"], environment: { CADDY_ADMIN: "off", ACME_EMAIL: "ops@example.org" } },
+      db: { image: "${PG_IMAGE:-postgres:17.6-bookworm}", restart: "unless-stopped", environment: { POSTGRES_PASSWORD: "${PG_PASSWORD:?missing}" } },
+      // a third-party service without environment: has nothing to compare, so it is not named either
+      cache: { image: "redis:7.4.1-alpine", restart: "unless-stopped" },
+    },
+  };
+  const result = c5(good);
+  assert.equal(result.status, "PASS", result.message);
+  assert.match(result.message, /у api, worker —/); // only our services were compared…
+  assert.match(result.message, /сторонні образи не звірялися: proxy, db$/); // …and the skipped ones are named, not hidden
+});
+
+test("C5: the compose shape at the time of the incident: v1.7.3 passes, v1.8.0 fails", () => {
+  // deploy/compose.yaml as on main before Task D: api built from the repo, worker on the same
+  // literal image — compared with the real app/src/config.js
+  const config = readFileSync(join(REPO, "app", "src", "config.js"), "utf8");
+  const env = (pool) => ({
+    TZ: "Europe/Kyiv",
+    LOG_LEVEL: "info",
+    DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat",
+    ...pool,
+    DB_POOL_WAIT_MS: "2000",
+    SMS_BASE_URL: "https://sms.example.net/api/v2",
+    SMS_TOKEN: "CHANGE_ME",
+    SMS_RATE_PER_SEC: "20",
+    COURIER_BASE_URL: "https://courier.example.com/api/v1",
+  });
+  const release = (pool) => ({
+    services: {
+      api: { image: "poshtomat:latest", build: { context: "../app", dockerfile: "../deploy/Dockerfile" }, ports: ["8080:8080"], environment: { ...env(pool), PORT: "8080" } },
+      worker: { image: "poshtomat:latest", command: ["node", "src/worker.js"], environment: env(pool) },
+    },
+  });
+  const v173 = c5(release({ DB_POOL_MAX: "20" }), { text: config });
+  assert.equal(v173.status, "PASS", v173.message);
+  const v180 = c5(release({ DB_POOL_SIZE: "20" }), { text: config });
+  assert.equal(v180.status, "FAIL");
+  assert.equal(v180.message, "app/src/config.js не читає: DB_POOL_SIZE (api, worker)");
+});
+
+test("C5: every service that runs our code is compared, however compose starts it", () => {
+  const renamed = { DB_POOL_SIZE: "20" };
+  const unread = (...names) => new RegExp(`не читає: DB_POOL_SIZE \\(${names.join(", ")}\\)`);
+  const only = (svc) => c5({ services: { svc } });
+  // build: alone
+  assert.match(only({ build: { context: "../app" }, environment: renamed }).message, unread("svc"));
+  // a literal image started with a file of app/ — also behind ./, /app/, sh -c and quotes
+  for (const command of [["node", "src/worker.js"], ["node", "./src/worker.js"], ["node", "/app/src/worker.js"], ["sh", "-c", 'exec node "./src/server.js"']]) {
+    assert.match(only({ image: "ghcr.io/example/poshtomat:1.9.0", command, environment: renamed }).message, unread("svc"), command.join(" "));
+  }
+  // an npm script of app/package.json; a script that does not exist there is not ours
+  assert.match(only({ image: "ghcr.io/example/poshtomat:1.9.0", command: ["npm", "run", "expire"], environment: renamed }).message, unread("svc"));
+  assert.match(only({ image: "ghcr.io/example/poshtomat:1.9.0", command: "npm start", environment: renamed }).message, unread("svc"));
+  assert.match(only({ image: "ghcr.io/example/poshtomat:1.9.0", command: ["npm", "--silent", "run", "expire"], environment: renamed }).message, unread("svc"));
+  assert.match(only({ image: "example/tool:1.0", command: ["npm", "run", "no-such-script"], environment: renamed }).message, /жоден сервіс/);
+  // a .js file that is not in app/ is someone else's program
+  assert.match(only({ image: "example/other:2.0", command: ["node", "index.js"], environment: renamed }).message, /жоден сервіс/);
+  // the API on the image's default CMD (no command:), pinned by a tag or a tag variable: ours,
+  // because it runs the same image as the worker — the rename only in api is still caught
+  for (const tag of ["1.9.0", "${TAG:?set TAG}"]) {
+    const shared = {
+      services: {
+        api: { image: `ghcr.io/example/poshtomat:${tag}`, ports: ["8080:8080"], environment: renamed },
+        worker: { image: "ghcr.io/example/poshtomat:1.9.0", command: ["node", "src/worker.js"], environment: { DB_POOL_MAX: "20" } },
+      },
+    };
+    assert.match(c5(shared).message, unread("api"), tag);
+  }
+  // the same image under another spelling: tag + digest vs digest, a registry from a variable,
+  // Docker Hub's implicit docker.io/library/
+  for (const [api, worker] of [
+    ["ghcr.io/example/poshtomat:1.9.0@sha256:aa", "ghcr.io/example/poshtomat@sha256:aa"],
+    ["${REGISTRY:?set REGISTRY}/poshtomat:1.9.0", "${REGISTRY:?set REGISTRY}/poshtomat:1.9.1"],
+    ["poshtomat:1.9.0", "docker.io/library/poshtomat:1.9.0"],
+  ]) {
+    const pair = {
+      services: {
+        api: { image: api, environment: renamed },
+        worker: { image: worker, command: ["node", "src/worker.js"], environment: { DB_POOL_MAX: "20" } },
+      },
+    };
+    assert.match(c5(pair).message, unread("api"), api);
+  }
+  // next to services that are certainly ours (${IMAGE}), a command that merely looks like ours —
+  // npm start, src/server.js — on someone else's image does not make that image ours
+  const lookalikes = {
+    services: {
+      api: appSvc({ DB_POOL_MAX: "20" }, { command: ["node", "src/server.js"] }),
+      relay: { image: "ghcr.io/other/webhook-relay:2.1.0", command: "npm start", environment: { RELAY_SECRET: "${RELAY_SECRET:?missing}" } },
+      mock: { image: "ghcr.io/other/mock-sms:1.0.0", command: ["node", "src/server.js"], environment: { MOCK_DELAY_MS: "50" } },
+    },
+  };
+  const result = c5(lookalikes);
+  assert.equal(result.status, "PASS", result.message);
+  assert.match(result.message, /у api —.*сторонні образи не звірялися: relay, mock$/);
+});
+
+test("C5: what only looks like reading the variable does not count", () => {
+  const one = (environment, extra) => ({ services: { api: appSvc(environment, extra) } });
+  // the name must match whole: DB_POOL is a substring of env.DB_POOL_MAX, yet nobody reads it
+  assert.equal(c5(one({ DB_POOL: "20" })).status, "FAIL");
+  assert.equal(c5(one({ DB_POOL_MAXX: "20" })).status, "FAIL"); // a typo
+  // a renamed variable left in a comment of config.js is still not read
+  const commented = CONFIG_JS.replace("    dbPoolMax:", "    // v1.8.0 tried env.DB_POOL_SIZE here\n    /* env.DB_POOL_SIZE */ dbPoolMax:");
+  assert.equal(c5(one({ DB_POOL_SIZE: "20" }), { text: commented }).status, "FAIL");
+  assert.equal(c5(one({ DB_POOL_MAX: "20" }), { text: commented }).status, "PASS");
+  // …and so is one only mentioned in a string or after `;//`
+  const mentioned = CONFIG_JS.replace("  return {", '  log.warn("env.DB_POOL_SIZE was renamed");x();// env.DB_POOL_SIZE\n  return {');
+  assert.equal(c5(one({ DB_POOL_SIZE: "20" }), { text: mentioned }).status, "FAIL");
+  // a runtime-variable exemption is by whole name too
+  assert.equal(c5(one({ TZ_NAME: "Kyiv" })).status, "FAIL");
+  // environment: given as a plain string is reported as such, not split into characters
+  assert.match(c5(one("DB_POOL_MAX=20")).message, /environment: не словник і не список: api/);
+  assert.match(c5(one([{ DB_POOL_MAX: 20 }])).message, /environment: не словник і не список: api/);
+  // without config.js, or without any service recognisable as ours, the rule cannot vouch for anything
+  assert.equal(c5(one({ DB_POOL_MAX: "20" }), { text: null }).status, "FAIL");
+  assert.equal(c5({ services: { proxy: { image: "caddy:2.8.4-alpine", environment: { CADDY_ADMIN: "off" } } } }).status, "FAIL");
+});
+
+test("C5: names read from the environment", () => {
+  const read = (code) => [...envNamesRead(code)].sort();
+  assert.deepEqual(read('const a = env.A; const b = process.env.B;\nconst c = env["C"], d = env[\'D\'];\n// env.E\n/* env.F */ const u = "http://x" || env.G;\n'), ["A", "B", "C", "D", "G"]);
+  assert.deepEqual(read("const p = env?.PORT ?? process.env?.['DB_URL'];"), ["DB_URL", "PORT"]);
+  assert.deepEqual(read("const { PORT, DB_POOL_MAX: max = 4, ...rest } = process.env;\nfunction f({ LOG_LEVEL } = env) {}"), ["DB_POOL_MAX", "LOG_LEVEL", "PORT"]);
+  assert.deepEqual(read("const t = `pool ${env.DB_POOL_MAX} at ${`${env.DATABASE_URL}`}`;"), ["DATABASE_URL", "DB_POOL_MAX"]);
+  // strings and comments never count — unless env is indexed by a variable, where the names
+  // live in string literals (a helper of action item #1): then whole UPPER_CASE literals count
+  assert.deepEqual(read('log("env.A is gone"); const s = "B"; /* env.C */'), []);
+  assert.deepEqual(read(String.raw`log("say \"env.A\" twice"); const b = env.B;`), ["B"]); // an escaped quote does not end the string
+  const helper = 'const need = (name) => { const v = env[name]; if (!v) throw new Error(`${name} is required`); return v; };\nneed("DB_POOL_MAX"); need(\'SMS_TOKEN\'); log("not a Name");';
+  assert.deepEqual(read(helper), ["DB_POOL_MAX", "SMS_TOKEN"]);
+  assert.deepEqual(read('const v = process.env[name]; need("DB_POOL_MAX");'), ["DB_POOL_MAX"]);
+  // a key in parentheses is the same access
+  assert.deepEqual(read('const v = env[(name)] ?? process.env?.[ ( key ) ]; need("DB_POOL_MAX");'), ["DB_POOL_MAX"]);
+  assert.deepEqual(read('const v = env[("DB_POOL_MAX")] ?? process.env[ ( "PORT" ) ];'), ["DB_POOL_MAX", "PORT"]);
+  // …and so is a key built from parts ("DB_" is a whole UPPER_CASE literal too), while one literal key is not
+  assert.deepEqual(read('const v = env["DB_" + name]; need("POOL_MAX");'), ["DB_", "POOL_MAX"]);
+  assert.deepEqual(read('const v = env[`${p}_URL`]; need("DB_POOL_MAX");'), ["DB_POOL_MAX"]);
+  assert.deepEqual(read('const v = env["PORT"] ?? env[ ( `HOST` ) ]; log("NOT_READ");'), ["HOST", "PORT"]);
+  // …but not when someone else's object or a private field is indexed
+  assert.deepEqual(read('const v = this.#env[name] ?? settings.env[key]; need("DB_POOL_SIZE");'), []);
+  // `env` as a whole word only: myenv.X is someone else's object
+  assert.deepEqual(read("const x = myenv.X + envy.Y;"), []);
+  // …and so is settings.env.X, while a method called on env reads nothing
+  assert.deepEqual(read("const s = settings.env.DB_POOL_SIZE + this.env?.Z; const t = process.env.T.trim();"), ["T"]);
+  assert.deepEqual(read("const s = settings . env.DB_POOL_SIZE + cfg\n  .env.Y; const u = process . env.U; function f() { return env.V; }"), ["U", "V"]);
+  assert.deepEqual(read('const s = settings.env["DB_POOL_SIZE"] + cfg . env?.["Y"] + settings.process.env["Z"];'), []);
+  // …and so is a private field #env
+  assert.deepEqual(read('const s = this.#env.DB_POOL_SIZE + this.#env["DB_POOL_MAX"];'), []);
+  assert.deepEqual(read('const s = settings.env.hasOwnProperty("A") + this.#env.hasOwnProperty("B");'), []);
+  assert.deepEqual(read('const s = process.env.hasOwnProperty("D");'), ["D"]);
+  // …but the dots of a spread are no member access
+  assert.deepEqual(read("const h = [...env.HOSTS, ... process.env.PEERS, ...settings.env.DB_POOL_SIZE];"), ["HOSTS", "PEERS"]);
+  assert.deepEqual(read('const h = [...env["HOSTS"], ...process.env?.["PEERS"], ...settings.env["DB_POOL_SIZE"]];'), ["HOSTS", "PEERS"]);
+  // presence checks
+  assert.deepEqual(read('if ("A" in env || Object.hasOwn(process.env, "B") || Reflect.has(env, \'C\') || env.hasOwnProperty("D")) {}'), ["A", "B", "C", "D"]);
+  // regex literals are skipped: their // is no comment, their quote opens no string…
+  assert.deepEqual(read(String.raw`const url = /^https?:\/\//.test(env.SMS_BASE_URL) ? env.SMS_BASE_URL : bad();`), ["SMS_BASE_URL"]);
+  assert.deepEqual(read('const q = /["]/; const a = env.A; const m = "env.DB_POOL_SIZE was renamed";'), ["A"]);
+  assert.deepEqual(read('const q = /[/"]/g; const b = env.B; const m = "x";'), ["B"]); // a / inside [...] does not end the regex
+  assert.deepEqual(read(String.raw`if (x) /https?:\/\//.test(u); const p = env.DB_POOL_MAX;`), ["DB_POOL_MAX"]); // after the ) of a condition
+  // …while a / after a value is a division, not a regex
+  assert.deepEqual(read("const half = env.X / 2 / (env.Y) / 3;"), ["X", "Y"]);
+});
+
+test("C5 on the repo's own files: the current compose passes, the v1.8.0 rename fails", () => {
+  const dir = mkdtempSync(join(tmpdir(), "check-deploy-c5-"));
+  try {
+    mkdirSync(join(dir, "deploy"));
+    mkdirSync(join(dir, "app", "src"), { recursive: true });
+    for (const file of ["src/config.js", "package.json"]) writeFileSync(join(dir, "app", file), readFileSync(join(REPO, "app", file), "utf8"));
+    const current = readFileSync(join(REPO, "deploy", "compose.yaml"), "utf8");
+    const only = RULES.filter((r) => r.id === "C5");
+
+    writeFileSync(join(dir, "deploy", "compose.yaml"), current);
+    const context = loadContext(dir);
+    const ok = runChecks(context, only)[0];
+    assert.equal(ok.status, "PASS", ok.message);
+
+    // the services that set DB_POOL_MAX, from the parsed compose — not a hard-coded list
+    const setsPool = ([, svc]) => {
+      const env = svc?.environment ?? {};
+      return Array.isArray(env) ? env.some((e) => String(e).split("=")[0] === "DB_POOL_MAX") : Object.hasOwn(env, "DB_POOL_MAX");
+    };
+    const expected = Object.entries(context.compose.data.services).filter(setsPool).map(([name]) => name);
+    assert.ok(expected.length, "the current compose must set DB_POOL_MAX somewhere");
+
+    const renamed = current.replace(/\bDB_POOL_MAX(?=\s*[:=])/g, "DB_POOL_SIZE"); // what v1.8.0 did, in map or list form
+    writeFileSync(join(dir, "deploy", "compose.yaml"), renamed);
+    const broken = runChecks(loadContext(dir), only)[0];
+    assert.equal(broken.status, "FAIL");
+    assert.match(broken.message, new RegExp(`DB_POOL_SIZE \\(${expected.join(", ")}\\)`));
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test("W1: the workflow exists, parses, and does not use pull_request_target", () => {
@@ -273,7 +522,7 @@ test("when npx cannot run, the YAML rules say so instead of blaming the files", 
     const results = runChecks(loadContext(dir, { parse: offline }));
     assert.equal(calls, 1, "after the first failure npx is not tried again");
     const by = Object.fromEntries(results.map((r) => [r.id, r]));
-    for (const id of ["D3", "C1", "C2", "C3", "C4", "W1"]) {
+    for (const id of ["D3", "C1", "C2", "C3", "C4", "C5", "W1"]) {
       assert.equal(by[id].status, "FAIL", id);
       assert.equal(by[id].toolError, true, id);
       assert.match(by[id].message, /не вдалося запустити npx yaml@2\.8\.1 — перший запуск потребує мережі \(npm error code ENOTCACHED\)/, id);
@@ -331,6 +580,7 @@ test("the CLI prints a row per rule, survives broken YAML and exits 1 on failure
     assert.deepEqual(rows, {
       D1: "PASS", D2: "PASS", D3: "FAIL", D4: "PASS",
       C1: "PASS", C2: "PASS", C3: "PASS", C4: "PASS",
+      C5: "FAIL", // the temp tree has no app/src/config.js to compare compose with
       W1: "FAIL", W2: "SKIP", W3: "SKIP", W4: "SKIP", W5: "SKIP",
     });
     assert.match(out, /W1 +FAIL .*не розібрався як YAML/);
