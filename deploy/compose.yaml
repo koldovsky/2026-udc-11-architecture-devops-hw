@@ -8,7 +8,8 @@
 # Без будь-якої з них compose відмовиться стартувати (${VAR:?…}), а не підставить порожнє.
 #
 # Запуск/оновлення:  docker compose up -d --wait
-# Відкат:            cp .env.previous .env && docker compose up -d --wait
+# Відкат:            cp -p .env.previous .env && cp -p compose.yaml.previous compose.yaml && docker compose up -d --wait
+#                    (знімків немає після першого деплою — тоді відкату немає, docs/runbook.md)
 # Нічна задача (cron, docs/ops/backup-runbook.md): docker compose run --rm worker npm run expire
 #
 # Імена змінних — лише ті, що читає app/src/config.js. Невідоме ім'я застосунок мовчки

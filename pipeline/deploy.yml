@@ -13,6 +13,15 @@
 #       SMS_TOKEN           — токен SMS-провайдера
 #   * Environment variables (не секрети): DEPLOY_HOST, DEPLOY_USER
 #
+# Підготовка VM — один раз, адміністратор з sudo (у пайплайна sudo немає):
+#   sudo useradd --create-home --shell /bin/bash deploy   # це DEPLOY_USER
+#   sudo usermod -aG docker deploy                        # docker compose без sudo
+#   sudo install -d -m 750 -o deploy -g deploy /opt/poshtomat
+#   публічна частина DEPLOY_SSH_KEY — у ~deploy/.ssh/authorized_keys
+# APP_DIR (/opt/poshtomat) має належати DEPLOY_USER: пайплайн пише туди compose.yaml,
+# .env і їхні знімки *.previous. Сам він каталог у /opt створити не може —
+# без цього кроку `install -d` на кроці «Передати…» впаде з Permission denied.
+#
 # Сторонні дії закріплено повним SHA коміту (тег — у коментарі; звірено git ls-remote 2026-11-03).
 
 name: deploy
@@ -122,6 +131,26 @@ jobs:
       DEPLOY_HOST: ${{ vars.DEPLOY_HOST }}
       DEPLOY_USER: ${{ vars.DEPLOY_USER }}
       APP_DIR: /opt/poshtomat
+      # Відкат до стану перед цим деплоєм — спільний для кроків деплою і smoke-тесту.
+      # Обидва знімки *.previous є, лише якщо до деплою на VM уже працювала версія.
+      # Інакше (перший деплой) повертатися нема до чого: стек невдалої версії зупиняємо,
+      # а її файли відкладаємо в *.failed, щоб наступний деплой не взяв їх за попередню версію.
+      ROLLBACK_SH: |
+        rollback() {
+          echo "$1" >&2
+          if [ -f .env.previous ] && [ -f compose.yaml.previous ]; then
+            cp -p .env.previous .env
+            cp -p compose.yaml.previous compose.yaml
+            docker compose up -d --wait --wait-timeout 120
+            echo 'Відкат на попередню версію виконано' >&2
+          else
+            docker compose down --remove-orphans || true
+            mv -f .env .env.failed
+            mv -f compose.yaml compose.yaml.failed
+            echo 'Попередньої версії немає (перший деплой): відкату не було, стек зупинено, файли в *.failed' >&2
+          fi
+          exit 1
+        }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -160,6 +189,7 @@ jobs:
           for v in "$DATABASE_URL" "$SMS_TOKEN"; do
             case "$v" in *"'"*|*$'\n'*) echo "secret contains a quote or newline" >&2; exit 1;; esac
           done
+          # APP_DIR готує адміністратор (див. «Підготовка VM» на початку файлу)
           ssh vm "install -m 750 -d '$APP_DIR'"
           ssh vm "cat > '$APP_DIR/compose.yaml.new'" < deploy/compose.yaml
           printf "IMAGE_REGISTRY='%s'\nIMAGE_TAG='%s'\nDATABASE_URL='%s'\nSMS_TOKEN='%s'\n" \
@@ -176,17 +206,18 @@ jobs:
           ssh vm "set -eu
             cd '$APP_DIR'
             trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
-            [ -f .env ] && cp -p .env .env.previous
-            [ -f compose.yaml ] && cp -p compose.yaml compose.yaml.previous
-            mv .env.new .env && mv compose.yaml.new compose.yaml
-            docker compose config --quiet
-            docker compose pull
-            if ! docker compose up -d --wait --wait-timeout 120 --remove-orphans; then
-              echo 'Деплой не пройшов healthcheck — відкат на попередню версію' >&2
-              cp -p .env.previous .env && cp -p compose.yaml.previous compose.yaml
-              docker compose up -d --wait --wait-timeout 120
-              exit 1
+            $ROLLBACK_SH
+            # знімок — лише повної попередньої версії; старі *.previous не беремо
+            rm -f .env.previous compose.yaml.previous
+            if [ -f .env ] && [ -f compose.yaml ]; then
+              cp -p .env .env.previous
+              cp -p compose.yaml compose.yaml.previous
             fi
+            mv .env.new .env
+            mv compose.yaml.new compose.yaml
+            docker compose config --quiet || rollback 'Конфігурація compose невалідна — відкат'
+            docker compose pull || rollback 'Не вдалося стягнути образ — відкат'
+            docker compose up -d --wait --wait-timeout 120 --remove-orphans || rollback 'Деплой не пройшов healthcheck — відкат'
             docker compose ps"
 
       # /health не ходить у БД і 14.10 відповідав 200 увесь інцидент. Тому після деплою —
@@ -196,6 +227,7 @@ jobs:
         run: |
           ssh vm "set -eu
             cd '$APP_DIR'
+            $ROLLBACK_SH
             ok=0
             for i in 1 2 3 4 5; do
               out=\$(curl -s -o /dev/null -w '%{http_code} %{time_total}' -X POST http://127.0.0.1:8080/pickup \
@@ -205,10 +237,7 @@ jobs:
               sleep 2
             done
             if [ \"\$ok\" -lt 4 ]; then
-              echo 'Smoke-тест не пройшов — відкат на попередню версію' >&2
-              cp -p .env.previous .env && cp -p compose.yaml.previous compose.yaml
-              docker compose up -d --wait --wait-timeout 120
-              exit 1
+              rollback 'Smoke-тест не пройшов — відкат'
             fi"
 
       - name: Підсумок

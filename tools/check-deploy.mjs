@@ -632,8 +632,8 @@ export const RULES = [
       if (!read) return skip(`немає ${APP_SOURCES.join(", ")} — нема з чим порівнювати`);
       const problem = composeProblem(compose);
       if (problem) return problem;
-      const appName = appPackageName(root);
-      const app = services(compose).filter(([, svc]) => isAppService(svc, appName, root));
+      const pkg = appPackage(root);
+      const app = services(compose).filter(([, svc]) => isAppService(svc, pkg, root));
       if (!app.length) return skip("у compose немає сервісу, зібраного з app/ або з образу застосунку");
       const problems = [];
       for (const [name, svc] of app) {
@@ -654,43 +654,125 @@ export const APP_SOURCES = ["app/src", "app/bin"];
 // read by Node.js, the OS or libraries, not by app code
 const RUNTIME_ENV = /^(TZ|NODE_ENV|NODE_OPTIONS|NODE_EXTRA_CA_CERTS|LANG|LC_[A-Z]+|(HTTPS?|NO)_PROXY)$/i;
 
-/** Every NAME the app reads as env.NAME / env["NAME"] in app/src and app/bin; null when there is no app code. */
+/** Every NAME the app reads as env.NAME / env["NAME"] in app/src and app/bin (subdirectories too); null when there is no app code. */
 export function appEnvNames(root) {
   const names = new Set();
   let found = false;
   for (const dir of APP_SOURCES) {
     const full = join(root, dir);
     if (!existsSync(full)) continue;
-    for (const file of readdirSync(full).filter((f) => /\.[cm]?js$/.test(f))) {
+    for (const entry of readdirSync(full, { recursive: true, withFileTypes: true })) {
+      if (!entry.isFile() || !/\.[cm]?js$/.test(entry.name)) continue;
       found = true;
-      const text = readFileSync(join(full, file), "utf8");
+      const text = codeOnly(readFileSync(join(entry.parentPath, entry.name), "utf8"));
       for (const m of text.matchAll(/\benv\s*(?:\.\s*([A-Za-z_][A-Za-z0-9_]*)|\[\s*["']([A-Za-z_][A-Za-z0-9_]*)["']\s*\])/g)) names.add(m[1] ?? m[2]);
     }
   }
   return found ? names : null;
 }
 
-function appPackageName(root) {
+// after one of these (or at the start) a "/" opens a regex literal; otherwise it divides
+const REGEX_BEFORE = /(?:^|[(,=:[!&|?{};+\-*%<>~^]|\b(?:return|typeof|case|do|else|in|of|new|delete|void|throw|yield|await))\s*$/;
+
+/**
+ * JS source with comments, the text of strings and templates, and regex literals blanked,
+ * so `env.NAME` in a comment or a log message is not a read. Kept: a string right after
+ * `env[` (env["NAME"]) and the ${…} expressions inside templates.
+ */
+function codeOnly(text) {
+  let out = "";
+  const templates = []; // brace depth outside each open ${…}
+  let depth = 0;
+  // template text from i (just past ` or }) up to the closing ` or the next ${
+  const templateText = (i) => {
+    while (i < text.length && text[i] !== "`" && !(text[i] === "$" && text[i + 1] === "{")) i += text[i] === "\\" ? 2 : 1;
+    if (i >= text.length || text[i] === "`") {
+      out += "`";
+      return i + 1;
+    }
+    out += "${";
+    templates.push(depth);
+    depth = 0;
+    return i + 2;
+  };
+  let i = text.startsWith("#!") ? text.indexOf("\n") : 0;
+  if (i === -1) i = text.length;
+  while (i < text.length) {
+    const ch = text[i];
+    const next = text[i + 1];
+    if (ch === "/" && next === "/") {
+      const end = text.indexOf("\n", i);
+      i = end === -1 ? text.length : end;
+    } else if (ch === "/" && next === "*") {
+      const end = text.indexOf("*/", i + 2);
+      out += " ";
+      i = end === -1 ? text.length : end + 2;
+    } else if (ch === '"' || ch === "'") {
+      let j = i + 1;
+      while (j < text.length && text[j] !== ch && text[j] !== "\n") j += text[j] === "\\" ? 2 : 1;
+      out += /\benv\s*\[\s*$/.test(out.slice(-64)) ? text.slice(i, j + 1) : ch + ch;
+      i = j + 1;
+    } else if (ch === "`") {
+      out += "`";
+      i = templateText(i + 1);
+    } else if (ch === "}" && depth === 0 && templates.length) {
+      out += "}";
+      depth = templates.pop();
+      i = templateText(i + 1);
+    } else if (ch === "/" && REGEX_BEFORE.test(out.slice(-64))) {
+      let j = i + 1;
+      let inClass = false;
+      while (j < text.length && text[j] !== "\n" && (inClass || text[j] !== "/")) {
+        if (text[j] === "[") inClass = true;
+        else if (text[j] === "]") inClass = false;
+        j += text[j] === "\\" ? 2 : 1;
+      }
+      out += "/r/";
+      i = j + 1;
+    } else {
+      if (ch === "{") depth += 1;
+      else if (ch === "}" && depth > 0) depth -= 1;
+      out += ch;
+      i += 1;
+    }
+  }
+  return out;
+}
+
+function appPackage(root) {
   try {
-    return JSON.parse(readFileSync(join(root, "app/package.json"), "utf8")).name ?? null;
+    return JSON.parse(readFileSync(join(root, "app/package.json"), "utf8"));
   } catch {
     return null;
   }
 }
 
 /**
- * Built from app/, runs a file of app/ (command: node src/worker.js), or runs an image
- * named after the app's package (registry and tag aside).
+ * Built from app/; runs a file of app/ (command: node src/worker.js, or node /app/src/worker.js —
+ * deploy/Dockerfile copies app/ into WORKDIR /app); runs an image named after the app's package
+ * (registry and tag aside); or runs a script of app/package.json (npm run worker) from an image
+ * that is one opaque variable — an image with a name of its own is some other program.
  */
-function isAppService(svc, appName, root) {
+function isAppService(svc, pkg, root) {
   const build = svc?.build;
   const context = typeof build === "string" ? build : build?.context;
   if (typeof context === "string" && /(^|[\\/])app[\\/]?$/.test(context.trim())) return true;
   const command = asList(svc?.command).join(" ").split(/\s+/);
-  if (command.some((t) => /^[\w./-]+\.[cm]?js$/.test(t) && existsSync(join(root, "app", t.replace(/^\.?\//, ""))))) return true;
-  if (!appName || typeof svc?.image !== "string") return false;
+  if (command.some((t) => /^[\w./-]+\.[cm]?js$/.test(t) && existsSync(join(root, "app", t.replace(/^(?:\/app\/|\.?\/)/, ""))))) return true;
+  if (typeof svc?.image !== "string") return false;
   const image = svc.image.replace(/\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*/g, "VAR"); // ${TAG:?…} has its own colon
-  return parseImageRef(image).name.split("/").at(-1) === appName;
+  const name = parseImageRef(image).name.split("/").at(-1);
+  if (pkg?.name && name === pkg.name) return true;
+  return name === "VAR" && runsAppScript(command, pkg?.scripts);
+}
+
+/** `npm run <script>` / `npm start` / `npm test` with a script that app/package.json defines. */
+function runsAppScript(command, scripts) {
+  const npm = command.indexOf("npm");
+  if (npm === -1 || !scripts) return false;
+  const [verb, name] = command.slice(npm + 1).filter((t) => !t.startsWith("-"));
+  const script = verb === "run" || verb === "run-script" ? name : verb;
+  return typeof script === "string" && Object.hasOwn(scripts, script);
 }
 
 /** A name the app does read that shares the first part (DB_POOL_SIZE → DB_POOL_MAX). */

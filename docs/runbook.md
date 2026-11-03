@@ -19,8 +19,9 @@
 2. **Чи був деплой за останню годину?** Це питання №1: 14.10 причиною був реліз за 4 хв до алерту.
    ```bash
    ssh poshtomat-prod-1
+   cd /opt/poshtomat                              # активні compose.yaml і .env, які пише пайплайн
    tail -n 5 /opt/poshtomat/deploys.log          # той самий формат, що incident/deploys.log
-   docker compose -f deploy/compose.yaml ps       # версія образу і час старту контейнерів
+   docker compose ps                              # версія образу і час старту контейнерів
    ```
    Деплой був за ≤ 60 хв до алерту → одразу переходьте до «Як підтвердити причину», рядок
    «пул БД». Не чекайте відповіді від постачальників.
@@ -35,11 +36,15 @@
 
 ## Діагностика
 
+Усі команди `docker compose` нижче — на VM у каталозі `/opt/poshtomat` (`cd /opt/poshtomat`).
+Там лежать активні `compose.yaml` і `.env`, які записав пайплайн; git-копії і каталогу `deploy/`
+на VM немає.
+
 | Питання | Команда | Як читати результат |
 |---|---|---|
-| Які помилки віддає API? | `docker compose -f deploy/compose.yaml logs --since 15m api \| grep -o '"error":"[^"]*"' \| sort \| uniq -c \| sort -rn` | `db pool wait timeout after 2000ms` — пул БД (найчастіша причина 503). `Cannot read properties of undefined (reading 'trim')` — це хронічні 500 на `POST /parcels` без `sender`, вони є і в звичайні дні (≈ 1 на 2 хв), алерт ними не пояснюється. |
-| Скільки з'єднань пулу реально доступно? | `docker compose -f deploy/compose.yaml exec api node -e 'import("./src/config.js").then(m=>console.log(m.loadConfig()))'` | `dbPoolMax: 4` — працює дефолт для локальної розробки (`app/src/config.js:9`), змінну не прочитано. У продакшні має бути `20`. |
-| Які змінні реально отримав контейнер? | `docker compose -f deploy/compose.yaml exec api env \| grep -E '^(DB_|SMS_|PORT\|DATABASE_URL)' \| sed 's/=.*TOKEN.*/=***/'` | Порівняйте імена з `app/src/config.js:6-15`. Ім'я, якого там немає (наприклад, `DB_POOL_SIZE`), застосунок ігнорує мовчки. |
+| Які помилки віддає API? | `docker compose logs --since 15m api \| grep -o '"error":"[^"]*"' \| sort \| uniq -c \| sort -rn` | `db pool wait timeout after 2000ms` — пул БД (найчастіша причина 503). `Cannot read properties of undefined (reading 'trim')` — це хронічні 500 на `POST /parcels` без `sender`, вони є і в звичайні дні (≈ 1 на 2 хв), алерт ними не пояснюється. |
+| Скільки з'єднань пулу реально доступно? | `docker compose exec api node -e 'import("./src/config.js").then(m=>console.log(m.loadConfig()))'` | `dbPoolMax: 4` — працює дефолт для локальної розробки (`app/src/config.js:9`), змінну не прочитано. У продакшні має бути `20`. |
+| Які змінні реально отримав контейнер? | `docker compose exec api env \| grep -E '^(DB_\|SMS_\|PORT\|DATABASE_URL)' \| sed 's/=.*/=***/'` | Порівняйте імена з `app/src/config.js:6-15`. Значення приховано всі: у `DATABASE_URL` — пароль БД, а для порівняння потрібні лише імена. Ім'я, якого там немає (наприклад, `DB_POOL_SIZE`), застосунок ігнорує мовчки. |
 | Пул зайнятий «під стелю»? | Метрики `db_pool_in_use` і `db_pool_waiting` за останні 15 хв у моніторингу | `db_pool_in_use` стоїть рівно на одному числі (4) і `db_pool_waiting` > 0 — стеля пулу. Для порівняння, звичайний день після обіду: `in_use` 11–13, `waiting` 0. |
 | Може, просто більше трафіку? | `rps` у моніторингу за ту саму годину сьогодні і тиждень/день тому | Сьогодні ≈ так само (14.10 і 13.10 о 14:03–14:47 — однаково 11,8 rps) → навантаження ні до чого. |
 | Може, БД блокує записи? | `date +%H:%M`; `sudo tail -n 3 /var/log/poshtomat/backup.log` | 02:00–02:30 бекап тримає блокування на запис (`docs/ops/backup-runbook.md:10-11`) — тоді 503 на записах очікувані, на `POST /pickup` — теж (видача пише статус). В інший час це не воно. |
@@ -64,10 +69,10 @@
 
 | Ситуація | Дія | Команда | Ризик / що перевірити після |
 |---|---|---|---|
-| Був деплой ≤ 60 хв тому, причина не очевидна за 5 хв | **Відкат** на попередню версію — спершу відкат, потім розбір | `cd /opt/poshtomat && git checkout <попередній тег> -- deploy/ && IMAGE_TAG=<попередня версія> docker compose -f deploy/compose.yaml up -d` | Відкат 14.10 зайняв 2 хв і одразу усунув проблему. Після — p95 < 500 мс за 2–3 хв. |
-| Змінна з неправильним ім'ям / пул = дефолт | Виправити ім'я в `deploy/compose.yaml` (`DB_POOL_MAX`), перезапустити api і worker | `docker compose -f deploy/compose.yaml up -d api worker` | Перевірити `loadConfig()` командою з «Діагностики» — `dbPoolMax: 20`. Зміну потім провести через PR. |
+| Був деплой ≤ 60 хв тому, причина не очевидна за 5 хв | **Відкат** на попередню версію зі знімків `*.previous`, які пайплайн зберігає перед кожним деплоєм — спершу відкат, потім розбір | `cd /opt/poshtomat && if [ -f .env.previous ] && [ -f compose.yaml.previous ]; then cp -p .env.previous .env && cp -p compose.yaml.previous compose.yaml && docker compose up -d --wait; else echo 'знімків немає — відкат неможливий, ескалюйте'; fi` | Відкат 14.10 зайняв 2 хв і одразу усунув проблему. Після — p95 < 500 мс за 2–3 хв. Знімків немає після першого деплою — тоді команда нічого не змінює, ескалюйте. Не погоджуйте наступний деплой у `production`, поки не розберетеся. |
+| Змінна з неправильним ім'ям / пул = дефолт | Виправити ім'я в `/opt/poshtomat/compose.yaml` (`DB_POOL_MAX`), перезапустити api та worker | `cd /opt/poshtomat && docker compose up -d api worker` | Перевірити `loadConfig()` командою з «Діагностики» — `dbPoolMax: 20`. Наступний деплой перезапише `/opt/poshtomat/compose.yaml`, тож те саме виправлення внесіть у `deploy/compose.yaml` через PR. |
 | 503 о 02:00–02:30 | Нічого не робити — чекати кінця бекапу | — | Після 02:30 503 мають зникнути самі; якщо ні — це інша проблема, йдіть по таблиці знову. |
-| Причина невідома, деплою не було | Перезапуск api **не** лікує проблеми конфігурації (14.10 не допоміг). Збирайте дані й ескалюйте | `docker compose -f deploy/compose.yaml logs --since 30m api > /tmp/api-$(date +%H%M).log` | — |
+| Причина невідома, деплою не було | Перезапуск api **не** лікує проблеми конфігурації (14.10 не допоміг). Збирайте дані й ескалюйте | `docker compose logs --since 30m api > /tmp/api-$(date +%H%M).log` | — |
 
 ## Коли ескалювати і кого кликати
 
@@ -86,5 +91,5 @@
 - `db_pool_waiting` = 0, `db_pool_in_use` знову змінюється (не стоїть на одній цифрі).
 - Справжній запит з «Перших 5 хвилин» повертає `404` швидше ніж за 0,5 с.
 - У логах API за останні 5 хв немає `db pool wait timeout`:
-  `docker compose -f deploy/compose.yaml logs --since 5m api | grep -c 'db pool wait timeout'` → `0`.
+  `cd /opt/poshtomat && docker compose logs --since 5m api | grep -c 'db pool wait timeout'` → `0`.
 - Напишіть у `#poshtomat-oncall`, що відновлено, і заведіть задачу на розбір.

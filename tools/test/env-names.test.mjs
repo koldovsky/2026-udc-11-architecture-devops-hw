@@ -94,8 +94,60 @@ test("E1: skips without app code or without app services", () => {
   withApp((root) => assert.equal(e1(root, { cache: { image: "redis:7.4", environment: { A: "1" } } }).status, "SKIP"));
 });
 
+test("E1: npm run <script> of app/package.json and node /app/… also make a service the app's", () => {
+  withApp((root) => {
+    writeFileSync(join(root, "app", "package.json"), JSON.stringify({ name: "poshtomat", scripts: { worker: "node src/worker.js" } }));
+    writeFileSync(join(root, "app", "src", "worker.js"), "// worker\n");
+    const result = e1(root, {
+      worker: { image: "${POSHTOMAT_IMAGE:?}", command: ["npm", "run", "worker"], environment: { DB_POOL_SIZE: "20" } },
+      // the path inside the container: deploy/Dockerfile copies app/ into WORKDIR /app
+      sender: { image: "${POSHTOMAT_IMAGE:?}", command: ["node", "/app/src/worker.js"], environment: { DB_POOL_SIZE: "20" } },
+      // an image with a name of its own is some other program, whatever its npm script is called
+      other: { image: "node:24.22.2", command: "npm run worker", environment: { UPSTREAM: "api:8080" } },
+    });
+    assert.equal(result.status, "FAIL");
+    assert.match(result.message, /^worker: DB_POOL_SIZE/);
+    assert.match(result.message, /sender: DB_POOL_SIZE/);
+    assert.doesNotMatch(result.message, /other/);
+  });
+});
+
 test("appEnvNames: reads env.NAME and env[\"NAME\"]", () => {
   withApp((root) => {
     assert.deepEqual([...appEnvNames(root)].sort(), ["DB_POOL_MAX", "DB_POOL_WAIT_MS", "PORT", "SMS_TOKEN"]);
   });
+});
+
+test("appEnvNames: reads modules in subdirectories of app/src too", () => {
+  withApp((root) => {
+    mkdirSync(join(root, "app", "src", "lib"));
+    writeFileSync(join(root, "app", "src", "lib", "client.js"), "export const url = process.env.CLIENT_URL;\n");
+    assert.ok(appEnvNames(root).has("CLIENT_URL"));
+    assert.equal(e1(root, { api: { build: "../app", environment: { CLIENT_URL: "http://x" } } }).status, "PASS");
+  });
+});
+
+// env.NAME in comments, strings and template text is not a read; ${env.NAME} and env["NAME"] are
+const NOISY_CONFIG = `#!/usr/bin/env node
+// previously env.DB_POOL_SIZE — renamed after 2026-10-14
+/* env.OLD_NAME */
+const hint = "set env.FROM_STRING";
+const msg = \`env.FROM_TEMPLATE is \${env.IN_TEMPLATE}\`;
+const quote = /'/; const port = env.PORT; // a quote in a regex must not hide the code after it
+export function loadConfig(env = process.env) {
+  return { dbPoolMax: Number(env.DB_POOL_MAX) || 4, smsToken: env["SMS_TOKEN"] || "" };
+}
+`;
+
+test("appEnvNames: skips env.NAME in comments, strings and template text", () => {
+  withApp(
+    (root) => {
+      assert.deepEqual([...appEnvNames(root)].sort(), ["DB_POOL_MAX", "IN_TEMPLATE", "PORT", "SMS_TOKEN"]);
+      const wrong = e1(root, { api: { build: "../app", environment: { DB_POOL_SIZE: "20" } } });
+      assert.equal(wrong.status, "FAIL", "a comment that mentions env.DB_POOL_SIZE does not make it a read");
+      const right = e1(root, { api: { build: "../app", environment: { DB_POOL_MAX: "20", SMS_TOKEN: "${SMS_TOKEN:?}" } } });
+      assert.equal(right.status, "PASS", right.message);
+    },
+    { config: NOISY_CONFIG },
+  );
 });
