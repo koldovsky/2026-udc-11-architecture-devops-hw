@@ -168,3 +168,17 @@ test("C5 does not count env.NAME in comments, but keeps reads after // inside st
   const ok = checkTree({ "deploy/compose.yaml": compose, "app/src/config.js": withUrl });
   assert.equal(ok.status, "PASS", ok.message);
 });
+
+// Same for a leftover message string: "old env.DB_POOL_SIZE" is text, not a read. A read inside
+// ${…} of a template literal and env["NAME"] still count.
+test("C5 does not count env.NAME inside string literals, but counts ${env.X} and env[\"X\"]", () => {
+  const withMessage = CONFIG_JS + 'export const note = "renamed: old env.DB_POOL_SIZE → env.DB_POOL_MAX";\n';
+  const bad = checkTree({ "deploy/compose.yaml": composeWithPool("DB_POOL_SIZE"), "app/src/config.js": withMessage });
+  assert.equal(bad.status, "FAIL");
+  assert.match(bad.message, /api: DB_POOL_SIZE; worker: DB_POOL_SIZE$/);
+
+  const reads = CONFIG_JS + "export const a = `sender: ${process.env.SMS_SENDER}`;\nexport const b = process.env[\"REGION\"];\n";
+  const compose = composeWithPool("DB_POOL_MAX").replace("      PORT: \"8080\"", "      PORT: \"8080\"\n      SMS_SENDER: \"Poshtomat\"\n      REGION: \"kyiv\"");
+  const ok = checkTree({ "deploy/compose.yaml": compose, "app/src/config.js": reads });
+  assert.equal(ok.status, "PASS", ok.message);
+});

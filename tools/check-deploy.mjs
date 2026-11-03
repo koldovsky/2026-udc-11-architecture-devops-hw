@@ -375,8 +375,11 @@ const APP_SOURCE_DIRS = ["app/src", "app/bin"];
 // Read by the Node runtime itself, not by app code, so env.NAME never shows up for them:
 // TZ — the time zone (libc/ICU), NODE_OPTIONS — flags for the node binary.
 const RUNTIME_ENV = new Set(["TZ", "NODE_OPTIONS"]);
-// env.NAME / process.env.NAME / env["NAME"]
-const ENV_READ = /\benv\s*(?:\.\s*([A-Za-z_][A-Za-z0-9_]*)|\[\s*["'`]([A-Za-z_][A-Za-z0-9_]*)["'`]\s*\])/g;
+// Reads in code: env.NAME / process.env.NAME, and env["NAME"]. For the bracket form the name is
+// taken from the source at the opening quote — in the masked text the string itself is blank.
+const ENV_DOT = /\benv\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)/g;
+const ENV_BRACKET_OPEN = /\benv\s*\[\s*["'`]/g;
+const ENV_BRACKET_KEY = /^(["'`])([A-Za-z_][A-Za-z0-9_]*)\1\s*\]/;
 
 function jsFiles(dir) {
   if (!existsSync(dir)) return [];
@@ -388,36 +391,75 @@ function jsFiles(dir) {
 }
 
 /**
- * JS source with // and /* *\/ comments blanked out (newlines kept), so that `env.X` mentioned
- * only in a comment does not count as a read. String and template literals are kept as they
- * are: env["NAME"] needs its string, and "http://…" inside a string is not a comment.
- * Regex literals are not recognised (app code has none that contain // or /*).
+ * The same JS source, same length, with comments and the text of string literals replaced by
+ * spaces (newlines and quote marks kept). So `env.X` mentioned only in a comment or inside a
+ * message string does not count as a read, while code — including ${…} in template literals —
+ * stays as it is. Regex literals are not recognised (app code has none with quotes, // or /*).
  */
-export function stripJsComments(text) {
-  let out = "";
-  let quote = null; // ', " or ` while inside a string literal
-  for (let i = 0; i < text.length; i++) {
-    const c = text[i];
-    if (quote) {
-      out += c;
-      if (c === "\\") out += text[++i] ?? "";
-      else if (c === quote) quote = null;
-    } else if (c === "'" || c === '"' || c === "`") {
-      quote = c;
-      out += c;
-    } else if (c === "/" && text[i + 1] === "/") {
-      while (i < text.length && text[i] !== "\n") i++;
-      out += "\n";
-    } else if (c === "/" && text[i + 1] === "*") {
-      const end = text.indexOf("*/", i + 2);
-      const stop = end === -1 ? text.length : end + 2;
-      out += text.slice(i, stop).replace(/[^\n]/g, " ");
-      i = stop - 1;
+export function maskJs(src) {
+  const out = src.split("");
+  const n = src.length;
+  const blank = (k) => {
+    if (k < n && out[k] !== "\n") out[k] = " ";
+  };
+  const exprDepth = []; // one entry per open ${ … }: how deep { } nest inside it
+  // Template text from j; returns the index after the closing ` or after "${".
+  const templateText = (j) => {
+    while (j < n) {
+      if (src[j] === "\\") {
+        blank(j++);
+        blank(j++);
+      } else if (src[j] === "`") {
+        return j + 1;
+      } else if (src[j] === "$" && src[j + 1] === "{") {
+        exprDepth.push(0);
+        return j + 2;
+      } else {
+        blank(j++);
+      }
+    }
+    return j;
+  };
+  let i = 0;
+  while (i < n) {
+    const c = src[i];
+    if (c === "/" && src[i + 1] === "/") {
+      while (i < n && src[i] !== "\n") blank(i++);
+    } else if (c === "/" && src[i + 1] === "*") {
+      const end = src.indexOf("*/", i + 2);
+      const stop = end === -1 ? n : end + 2;
+      while (i < stop) blank(i++);
+    } else if (c === "'" || c === '"') {
+      i++;
+      while (i < n && src[i] !== c && src[i] !== "\n") {
+        if (src[i] === "\\") blank(i++);
+        blank(i++);
+      }
+      i++;
+    } else if (c === "`") {
+      i = templateText(i + 1);
+    } else if (c === "}" && exprDepth.length && exprDepth[exprDepth.length - 1] === 0) {
+      exprDepth.pop();
+      i = templateText(i + 1);
     } else {
-      out += c;
+      if (c === "{" && exprDepth.length) exprDepth[exprDepth.length - 1]++;
+      if (c === "}" && exprDepth.length) exprDepth[exprDepth.length - 1]--;
+      i++;
     }
   }
-  return out;
+  return out.join("");
+}
+
+/** Names one JS source reads from the environment (see maskJs for what does not count). */
+export function envReadsIn(src) {
+  const masked = maskJs(src);
+  const names = new Set();
+  for (const m of masked.matchAll(ENV_DOT)) names.add(m[1]);
+  for (const m of masked.matchAll(ENV_BRACKET_OPEN)) {
+    const key = src.slice(m.index + m[0].length - 1).match(ENV_BRACKET_KEY);
+    if (key) names.add(key[2]);
+  }
+  return names;
 }
 
 /** Names the app reads from the environment, or null when there is no app source at all. */
@@ -426,7 +468,7 @@ function appEnvReads(root) {
   if (!files.length) return null;
   const names = new Set();
   for (const file of files) {
-    for (const m of stripJsComments(readFileSync(file, "utf8")).matchAll(ENV_READ)) names.add(m[1] ?? m[2]);
+    for (const name of envReadsIn(readFileSync(file, "utf8"))) names.add(name);
   }
   return names;
 }

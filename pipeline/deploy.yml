@@ -163,6 +163,8 @@ jobs:
       # Тож пізніші `docker compose …` у цій теці (runbook, відкат) працюють з тим самим проєктом
       # `poshtomat` і з образом, який справді запущено, а невдалий деплой не потрапляє в історію.
       # Потрібен Docker Compose v2 з `up --wait-timeout`; скрипт перевіряє це першим кроком.
+      # Також деплой зупиняється, якщо в .env на сервері SMS_BASE_URL чи COURIER_BASE_URL — http://:
+      # app/ схему не перевіряє, а токен SMS іде в заголовку (app/src/sms.js:33).
       # Усе, що підставляється в текст віддаленої команди, спершу звіряється з суворим шаблоном:
       # назва тегу чи гілки, логін тощо можуть містити `$(…)`, `;` або лапки, а віддалений shell
       # розбирає рядок ще раз.
@@ -185,6 +187,8 @@ jobs:
               echo 'docker compose на VM не підтримує up --wait-timeout — оновіть Compose v2' >&2; exit 1; }
             export IMAGE='$IMAGE' IMAGE_TAG='$IMAGE_TAG'
             docker compose -f compose.yaml.new config -q
+            if docker compose -f compose.yaml.new config | grep -Eq '_BASE_URL: .?http://'; then
+              echo 'SMS_BASE_URL і COURIER_BASE_URL на проді мають бути https:// (SMS_TOKEN іде в заголовку Authorization)' >&2; exit 1; fi
             docker compose -f compose.yaml.new pull --quiet api worker
             if [ -f compose.yaml ]; then cp compose.yaml compose.yaml.prev; fi
             mv compose.yaml.new compose.yaml
