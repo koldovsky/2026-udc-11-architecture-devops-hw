@@ -1,0 +1,86 @@
+name: Test, build and deploy
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}
+  IMAGE_TAG: ${{ github.sha }}
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm test
+        working-directory: app
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: docker/build-push-action@v6
+        with:
+          context: ./app
+          file: ./deploy/Dockerfile
+          push: true
+          tags: ghcr.io/${{ github.repository }}:${{ github.sha }}
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          source: deploy/compose.yaml
+          target: ${{ secrets.DEPLOY_PATH }}
+      - uses: appleboy/ssh-action@v1.2.0
+        env:
+          IMAGE_NAME: ghcr.io/${{ github.repository }}
+          IMAGE_TAG: ${{ github.sha }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SMS_TOKEN: ${{ secrets.SMS_TOKEN }}
+          SMS_BASE_URL: ${{ secrets.SMS_BASE_URL }}
+          COURIER_BASE_URL: ${{ secrets.COURIER_BASE_URL }}
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          envs: IMAGE_NAME,IMAGE_TAG,DEPLOY_PATH,GHCR_USERNAME,GHCR_TOKEN,DATABASE_URL,SMS_TOKEN,SMS_BASE_URL,COURIER_BASE_URL
+          script: |
+            set -eu
+            cd "$DEPLOY_PATH"
+            umask 077
+            cat > .env <<EOF
+            IMAGE_NAME=$IMAGE_NAME
+            IMAGE_TAG=$IMAGE_TAG
+            DATABASE_URL=$DATABASE_URL
+            SMS_TOKEN=$SMS_TOKEN
+            SMS_BASE_URL=$SMS_BASE_URL
+            COURIER_BASE_URL=$COURIER_BASE_URL
+            EOF
+            printf '%s' "$GHCR_TOKEN" | docker login ghcr.io --username "$GHCR_USERNAME" --password-stdin
+            docker compose -f deploy/compose.yaml pull
+            docker compose -f deploy/compose.yaml up -d --remove-orphans
+            docker image prune -f

@@ -379,7 +379,33 @@ function oneShot(svc) {
   return String(svc?.restart ?? "") === "no" || svc?.deploy?.restart_policy?.condition === "none";
 }
 
+const POOL_ENV_NAME = /(^|_)POOL(_|$)/;
+
+function appEnvironmentNames(root) {
+  const path = join(root, "app/src/config.js");
+  if (!existsSync(path)) return null;
+  const text = readFileSync(path, "utf8");
+  return new Set([...text.matchAll(/\benv\.([A-Z][A-Z0-9_]*)\b/g)].map(([, name]) => name));
+}
+
 export const RULES = [
+  {
+    id: "C5",
+    title: "РЎСѓРјС–СЃРЅС–СЃС‚СЊ env-Р·РјС–РЅРЅРёС… РїСѓР»Сѓ Р‘Р”: РєРѕРґ С– compose",
+    hint: "РќР°Р·РІРё Р·РјС–РЅРЅРёС… Р· POOL Сѓ deploy РјР°СЋС‚СЊ Р±СѓС‚Рё СЃРµСЂРµРґ Р·РјС–РЅРЅРёС…, СЏРєС– РєРѕРґ С‡РёС‚Р°С” С‡РµСЂРµР· env.NAME. РќРµ РїРµСЂРµР№РјРµРЅРѕРІСѓР№С‚Рµ DB_POOL_MAX РЅР° DB_POOL_SIZE Р»РёС€Рµ РІ РѕРґРЅРѕРјСѓ Р· С€Р°СЂС–РІ.",
+    check({ root, compose }) {
+      const problem = composeProblem(compose);
+      if (problem) return problem;
+      const appNames = appEnvironmentNames(root);
+      if (!appNames) return fail("app/src/config.js РЅРµ Р·РЅР°Р№РґРµРЅРѕ");
+      const poolApp = [...appNames].filter((name) => POOL_ENV_NAME.test(name));
+      const poolDeploy = services(compose).flatMap(([, svc]) => envEntries(svc?.environment).map(([name]) => String(name)))
+        .filter((name) => POOL_ENV_NAME.test(name));
+      const unknown = [...new Set(poolDeploy.filter((name) => !appNames.has(name)))];
+      if (unknown.length) return fail(`compose передає невідомі для app pool-змінні: ${unknown.join(", ")}; app читає: ${poolApp.join(", ") || "жодної"}`);
+      return pass(poolDeploy.length ? `pool-змінні узгоджені: ${[...new Set(poolDeploy)].join(", ")}` : "pool-змінні в compose не задані; застосовуються defaults app");
+    },
+  },
   {
     id: "D1",
     title: "Базовий образ з явним тегом (не latest)",

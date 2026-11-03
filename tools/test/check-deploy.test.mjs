@@ -22,9 +22,9 @@ import {
 
 const CHECKER = fileURLToPath(new URL("../check-deploy.mjs", import.meta.url));
 
-function ctx({ dockerfile = null, compose, workflow } = {}) {
+function ctx({ root = ".", dockerfile = null, compose, workflow } = {}) {
   return {
-    root: ".",
+    root,
     dockerfile: dockerfileSource(dockerfile),
     compose: compose === undefined ? { exists: false } : { exists: true, data: compose },
     workflow: workflow === undefined ? { exists: false } : { exists: true, data: workflow },
@@ -35,6 +35,24 @@ function status(id, context) {
   const rule = RULES.find((r) => r.id === id);
   return rule.check(context).status;
 }
+
+test("C5: pool variable names must match app config without rejecting defaults", () => {
+  const dir = mkdtempSync(join(tmpdir(), "check-deploy-pool-"));
+  try {
+    mkdirSync(join(dir, "app", "src"), { recursive: true });
+    writeFileSync(join(dir, "app", "src", "config.js"), "export const pool = Number(env.DB_POOL_MAX) || 4;\n");
+    const incident = ctx({ root: dir, compose: compose(svc({ environment: { DB_POOL_SIZE: "${DB_POOL_SIZE:?required}" } })) });
+    assert.equal(status("C5", incident), "FAIL");
+
+    const correct = ctx({ root: dir, compose: compose(svc({ environment: { DB_POOL_MAX: "${DB_POOL_MAX:?required}" } })) });
+    assert.equal(status("C5", correct), "PASS");
+
+    const defaults = ctx({ root: dir, compose: compose(svc({ environment: { LOG_LEVEL: "info" } })) });
+    assert.equal(status("C5", defaults), "PASS");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 const svc = (extra = {}) => ({ image: "example/web:1.4.2", ...extra });
 const compose = (...list) => ({ services: Object.fromEntries(list.map((s, i) => [`s${i + 1}`, s])) });
@@ -330,7 +348,7 @@ test("the CLI prints a row per rule, survives broken YAML and exits 1 on failure
     const rows = Object.fromEntries(out.split("\n").filter((l) => /^[DCW]\d /.test(l)).map((l) => [l.slice(0, 2), l.slice(4, 8)]));
     assert.deepEqual(rows, {
       D1: "PASS", D2: "PASS", D3: "FAIL", D4: "PASS",
-      C1: "PASS", C2: "PASS", C3: "PASS", C4: "PASS",
+      C1: "PASS", C2: "PASS", C3: "PASS", C4: "PASS", C5: "FAIL",
       W1: "FAIL", W2: "SKIP", W3: "SKIP", W4: "SKIP", W5: "SKIP",
     });
     assert.match(out, /W1 +FAIL .*не розібрався як YAML/);
