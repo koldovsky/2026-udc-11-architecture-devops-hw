@@ -470,7 +470,7 @@ export const RULES = [
   {
     id: "D5",
     title: "DB pool env у Compose відповідає ключу, який читає застосунок",
-    hint: "У сервісах із DATABASE_URL або будь-яким DB_POOL_* ключем задайте ключ, який читає app/src/config.js, з додатним лімітом або обов'язковою Compose-підстановкою; не залишайте невідомий DB_POOL_* ключ замість нього.",
+    hint: "У сервісах із DATABASE_URL, env_file або будь-яким DB_POOL_* ключем задайте ключ, який читає app/src/config.js, з додатним лімітом або обов'язковою Compose-підстановкою; checker не може прочитати env_file, тому без явного DB_POOL_MAX перевірка завершується FAIL.",
     check({ appConfig, compose }) {
       const problem = composeProblem(compose);
       if (problem) return problem;
@@ -486,8 +486,9 @@ export const RULES = [
         const configuredPoolEntries = env.filter(([key]) => /^DB_POOL_[A-Z0-9_]+$/.test(key));
         const configuredPoolKeys = configuredPoolEntries.map(([key]) => key);
         const hasDatabaseUrl = envKeys.includes("DATABASE_URL");
+        const usesEnvFile = svc?.env_file !== undefined;
         const expectedEntry = env.find(([key]) => key === expected);
-        if ((hasDatabaseUrl || configuredPoolEntries.length > 0) && !expectedEntry) {
+        if ((hasDatabaseUrl || configuredPoolEntries.length > 0 || usesEnvFile) && !expectedEntry) {
           problems.push(`${name}: немає ${expected} (застосунок використовує default)`);
         }
         if (expectedEntry) {

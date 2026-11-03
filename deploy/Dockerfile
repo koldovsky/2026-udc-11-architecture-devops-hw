@@ -7,6 +7,7 @@ ENV NODE_ENV=production \
 WORKDIR /app
 COPY --chown=node:node app/package.json ./package.json
 COPY --chown=node:node app/src/ ./src/
+COPY --chown=node:node app/bin/ ./bin/
 
 USER node
 EXPOSE 8080

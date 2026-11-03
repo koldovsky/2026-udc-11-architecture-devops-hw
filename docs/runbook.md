@@ -65,5 +65,6 @@
 - <code>curl -sS --max-time 5 -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8080/health</code> повертає 200.
 - Read-only <code>GET /admin/parcels</code> з валідною сесією повертає 200.
 - Метрики p95 нижче 2,000 мс, error_rate нижче 0.05, db_pool_waiting дорівнює 0 щонайменше п'ять хвилин.
+- Перевіряйте ці значення на часових графіках із тієї системи моніторингу, що надіслала alert; звіряйте той самий часовий інтервал і service/instance. Для локального аналізу збереженого інциденту джерелом є `incident/metrics/2026-10-14.csv`, але цей файл не показує поточний production стан.
 - <code>docker compose -f deploy/compose.yaml logs --since=5m api</code> не показує нових db pool wait timeout.
 - Записані у #poshtomat-oncall версія, час відновлення і перевірені значення DB_POOL_MAX; секрети не публікуються.

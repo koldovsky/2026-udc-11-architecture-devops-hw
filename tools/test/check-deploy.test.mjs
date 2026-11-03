@@ -111,6 +111,8 @@ test("D5: database pool variables in compose match the key read by the applicati
   assert.equal(status("D5", { ...composeWithoutDatabaseUrl({ DB_POOL_MAX: "20" }), appConfig }), "PASS");
   assert.equal(status("D5", { ...composeWithoutDatabaseUrl({ DB_POOL_SIZE: "20" }), appConfig }), "FAIL");
   assert.equal(status("D5", { ...composeWithoutDatabaseUrl({ DB_POOL_MAX: null }), appConfig }), "FAIL");
+  assert.equal(status("D5", { ...ctx({ compose: compose(svc({ env_file: [".env.production"] })) }), appConfig }), "FAIL");
+  assert.equal(status("D5", { ...ctx({ compose: compose(svc({ env_file: [".env.production"], environment: { DB_POOL_MAX: "20" } })) }), appConfig }), "PASS");
 
   const extraUnsupported = composeWith({ DB_POOL_MAX: "20", DB_POOL_SIZE: "20" });
   assert.equal(status("D5", { ...extraUnsupported, appConfig }), "FAIL");
