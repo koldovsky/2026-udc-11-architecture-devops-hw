@@ -1,35 +1,75 @@
-# Поштомат громади — продакшн на одній VM (docker compose up -d).
+# Поштомат громади — продакшн на одній VM (2 vCPU, 4 GB RAM).
 # PostgreSQL працює на самій VM, поза compose.
+#
+# На VM (/opt/poshtomat) поруч лежить .env (chmod 600, поза git) — його пише
+# pipeline/deploy.yml з GitHub secrets:
+#   IMAGE_REGISTRY=ghcr.io/<owner>   IMAGE_TAG=sha-<commit>
+#   DATABASE_URL=postgres://…        SMS_TOKEN=…
+# Без будь-якої з них compose відмовиться стартувати (${VAR:?…}), а не підставить порожнє.
+#
+# Запуск/оновлення:  docker compose up -d --wait
+# Відкат:            cp .env.previous .env && docker compose up -d --wait
+# Нічна задача (cron, docs/ops/backup-runbook.md): docker compose run --rm worker npm run expire
+#
+# Імена змінних — лише ті, що читає app/src/config.js. Невідоме ім'я застосунок мовчки
+# ігнорує і бере значення за замовчуванням (інцидент 2026-10-14: DB_POOL_SIZE замість
+# DB_POOL_MAX → пул на 4 з'єднання). Це перевіряє правило E1 у tools/check-deploy.mjs.
+
+name: poshtomat
+
+x-app: &app
+  image: ${IMAGE_REGISTRY:?IMAGE_REGISTRY is not set (see .env)}/poshtomat:${IMAGE_TAG:?IMAGE_TAG is not set (see .env)}
+  init: true                        # tini як PID 1: пересилання сигналів, збір зомбі
+  cap_drop: [ALL]                   # непривілейований порт, capabilities не потрібні
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 256
+  logging:
+    driver: json-file
+    options:                        # інакше лог росте без меж і забиває 80 GB диска VM
+      max-size: "20m"
+      max-file: "5"
+
+x-common-env: &common-env
+  TZ: "Europe/Kyiv"
+  LOG_LEVEL: "info"
+  DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is not set (see .env)}
+  # Пул на процес. api і worker — 2 × 20 = 40 з'єднань до PostgreSQL на VM.
+  DB_POOL_MAX: "20"
+  DB_POOL_WAIT_MS: "2000"
+
 services:
   api:
-    image: poshtomat:latest
-    build:
-      context: ../app
-      dockerfile: ../deploy/Dockerfile
+    <<: *app
+    restart: unless-stopped
+    command: ["node", "src/server.js"]
     ports:
       - "8080:8080"
     environment:
-      TZ: "Europe/Kyiv"
+      <<: *common-env
       PORT: "8080"
-      LOG_LEVEL: "info"
-      DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
-      DB_POOL_MAX: "20"
-      DB_POOL_WAIT_MS: "2000"
-      SMS_BASE_URL: "https://sms.example.net/api/v2"
-      SMS_TOKEN: "CHANGE_ME"
-      SMS_RATE_PER_SEC: "20"
-      COURIER_BASE_URL: "https://courier.example.com/api/v1"
+    # healthcheck — з HEALTHCHECK образу (GET /health)
+    mem_limit: 512m
+    cpus: 1.0
 
   worker:
-    image: poshtomat:latest
+    <<: *app
+    restart: unless-stopped
     command: ["node", "src/worker.js"]
     environment:
-      TZ: "Europe/Kyiv"
-      LOG_LEVEL: "info"
-      DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
-      DB_POOL_MAX: "20"
-      DB_POOL_WAIT_MS: "2000"
+      <<: *common-env
       SMS_BASE_URL: "https://sms.example.net/api/v2"
-      SMS_TOKEN: "CHANGE_ME"
-      SMS_RATE_PER_SEC: "20"
+      SMS_TOKEN: ${SMS_TOKEN:?SMS_TOKEN is not set (see .env)}
+      # Ліміт облікового запису провайдера — 10 SMS/с, понад це 429 і повідомлення
+      # не надсилається (materials/vendors/sms-provider.md:16-17). Було 20 — звідси
+      # щоденні сотні 429 після обіду. Тримаємо запас від ліміту.
+      SMS_RATE_PER_SEC: "8"
+      # для нічної задачі: cron запускає її в контейнері worker (npm run expire)
       COURIER_BASE_URL: "https://courier.example.com/api/v1"
+    healthcheck:
+      disable: true                 # HTTP-сервера в worker немає, ports: теж
+    # Після SIGTERM worker дочікує поточне SMS + до 10 с паузи опитування; стандартних
+    # 10 с замало — SIGKILL посеред відправки дає дубль або втрату SMS.
+    stop_grace_period: 30s
+    mem_limit: 256m
+    cpus: 0.5

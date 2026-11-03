@@ -15,7 +15,7 @@
 // tools/test/<name>.test.mjs (npm run test:tools runs only tools/test/*.test.mjs).
 
 import { execSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -623,7 +623,86 @@ export const RULES = [
       return problems.length ? fail(`не закріплено: ${problems.join("; ")}`) : pass(`закріплено: ${count}`);
     },
   },
+  {
+    id: "E1",
+    title: "Змінні оточення сервісів застосунку — ті, які застосунок читає",
+    hint: "Ім'я змінної в environment: має збігатися з тим, що читає app/ (env.NAME у app/src, app/bin) — loadConfig() мовчки бере значення за замовчуванням для будь-якої змінної, якої немає (14.10 DB_POOL_SIZE замість DB_POOL_MAX дав пул на 4 з'єднання). Перейменовуєте змінну — перейменуйте її і в коді, і в compose в одному PR. Змінні середовища виконання (TZ, NODE_ENV, NODE_OPTIONS, проксі) дозволено завжди.",
+    check({ root, compose }) {
+      const read = appEnvNames(root);
+      if (!read) return skip(`немає ${APP_SOURCES.join(", ")} — нема з чим порівнювати`);
+      const problem = composeProblem(compose);
+      if (problem) return problem;
+      const appName = appPackageName(root);
+      const app = services(compose).filter(([, svc]) => isAppService(svc, appName, root));
+      if (!app.length) return skip("у compose немає сервісу, зібраного з app/ або з образу застосунку");
+      const problems = [];
+      for (const [name, svc] of app) {
+        for (const [key] of envEntries(svc?.environment)) {
+          if (read.has(key) || RUNTIME_ENV.test(key)) continue;
+          const like = similarName(key, read);
+          problems.push(`${name}: ${key} — застосунок такої змінної не читає${like ? ` (можливо, ${like}?)` : ""}`);
+        }
+      }
+      return problems.length ? fail(problems.join("; ")) : pass(`${app.map(([n]) => n).join(", ")}: усі змінні читаються застосунком`);
+    },
+  },
 ];
+
+// ---------------------------------------------------------------- E1 helpers
+
+export const APP_SOURCES = ["app/src", "app/bin"];
+// read by Node.js, the OS or libraries, not by app code
+const RUNTIME_ENV = /^(TZ|NODE_ENV|NODE_OPTIONS|NODE_EXTRA_CA_CERTS|LANG|LC_[A-Z]+|(HTTPS?|NO)_PROXY)$/i;
+
+/** Every NAME the app reads as env.NAME / env["NAME"] in app/src and app/bin; null when there is no app code. */
+export function appEnvNames(root) {
+  const names = new Set();
+  let found = false;
+  for (const dir of APP_SOURCES) {
+    const full = join(root, dir);
+    if (!existsSync(full)) continue;
+    for (const file of readdirSync(full).filter((f) => /\.[cm]?js$/.test(f))) {
+      found = true;
+      const text = readFileSync(join(full, file), "utf8");
+      for (const m of text.matchAll(/\benv\s*(?:\.\s*([A-Za-z_][A-Za-z0-9_]*)|\[\s*["']([A-Za-z_][A-Za-z0-9_]*)["']\s*\])/g)) names.add(m[1] ?? m[2]);
+    }
+  }
+  return found ? names : null;
+}
+
+function appPackageName(root) {
+  try {
+    return JSON.parse(readFileSync(join(root, "app/package.json"), "utf8")).name ?? null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Built from app/, runs a file of app/ (command: node src/worker.js), or runs an image
+ * named after the app's package (registry and tag aside).
+ */
+function isAppService(svc, appName, root) {
+  const build = svc?.build;
+  const context = typeof build === "string" ? build : build?.context;
+  if (typeof context === "string" && /(^|[\\/])app[\\/]?$/.test(context.trim())) return true;
+  const command = asList(svc?.command).join(" ").split(/\s+/);
+  if (command.some((t) => /^[\w./-]+\.[cm]?js$/.test(t) && existsSync(join(root, "app", t.replace(/^\.?\//, ""))))) return true;
+  if (!appName || typeof svc?.image !== "string") return false;
+  const image = svc.image.replace(/\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*/g, "VAR"); // ${TAG:?…} has its own colon
+  return parseImageRef(image).name.split("/").at(-1) === appName;
+}
+
+/** A name the app does read that shares the first part (DB_POOL_SIZE → DB_POOL_MAX). */
+function similarName(key, read) {
+  const parts = key.split("_");
+  for (let n = parts.length - 1; n >= 1; n -= 1) {
+    const prefix = `${parts.slice(0, n).join("_")}_`;
+    const hit = [...read].find((r) => r.startsWith(prefix));
+    if (hit) return hit;
+  }
+  return null;
+}
 
 // ---------------------------------------------------------------- running
 
