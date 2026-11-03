@@ -131,15 +131,33 @@ jobs:
       # Стягнути новий образ і перестворити контейнери (короткий простій, поки compose їх перестворює).
       # GHCR_TOKEN — PAT з правом packages:read у секретах репо. Він іде у віддалений docker login
       # через stdin (не аргументом), тож не видний у списку процесів і в історії shell на сервері.
+      # Лише ПІСЛЯ успішних pull і up IMAGE та IMAGE_TAG записуються в /opt/poshtomat/.env (решта
+      # рядків — секрети, які веде адміністратор, — не чіпаються) і додається рядок у deploys.log.
+      # Тож пізніші `docker compose …` у цій теці (runbook, відкат) працюють з тим самим проєктом
+      # `poshtomat` і з образом, який справді запущено, а невдалий деплой не потрапляє в історію.
+      # Усе, що підставляється в текст віддаленої команди, спершу звіряється з суворим шаблоном:
+      # назва тегу чи гілки, логін тощо можуть містити `$(…)`, `;` або лапки, а віддалений shell
+      # розбирає рядок ще раз.
       - name: Pull image and restart services
         env:
           GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
           GHCR_USER: ${{ github.repository_owner }}
         run: |
+          check() { [[ "$2" =~ $3 ]] || { echo "::error::$1 має недозволені символи"; exit 1; }; }
+          check IMAGE "$IMAGE" '^ghcr\.io/[a-z0-9._/-]+$'
+          check IMAGE_TAG "$IMAGE_TAG" '^sha-[0-9a-f]{40}$'
+          check GITHUB_REF_NAME "$GITHUB_REF_NAME" '^[A-Za-z0-9._/-]+$'
+          check GITHUB_ACTOR "$GITHUB_ACTOR" '^[A-Za-z0-9-]+(\[bot\])?$'
+          check GHCR_USER "$GHCR_USER" '^[A-Za-z0-9-]+$'
+          check GITHUB_RUN_ID "$GITHUB_RUN_ID" '^[0-9]+$'
           printf '%s\n' "$GHCR_TOKEN" | ssh prod "docker login ghcr.io -u '$GHCR_USER' --password-stdin"
           ssh prod "set -eu
             cd /opt/poshtomat
             export IMAGE='$IMAGE' IMAGE_TAG='$IMAGE_TAG'
             docker compose pull --quiet api worker
             docker compose up -d --remove-orphans --no-build
+            touch .env
+            sed -i '/^IMAGE=/d; /^IMAGE_TAG=/d' .env
+            printf 'IMAGE=%s\nIMAGE_TAG=%s\n' '$IMAGE' '$IMAGE_TAG' >> .env
+            echo \"\$(date -Iseconds)   deploy    $GITHUB_REF_NAME   $GITHUB_ACTOR   image $IMAGE_TAG, run $GITHUB_RUN_ID\" >> deploys.log
             docker image prune -f"

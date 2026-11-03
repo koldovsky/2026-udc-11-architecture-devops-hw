@@ -11,7 +11,7 @@
 # Необов'язкова:
 #   IMAGE            — шлях до образу, за замовчуванням poshtomat (локальна збірка)
 #
-# Прод:     IMAGE=ghcr.io/<org>/<repo> IMAGE_TAG=sha-<commit> docker compose up -d --no-build
+# Прод:     у /opt/poshtomat; IMAGE і IMAGE_TAG pipeline пише в .env там же → docker compose up -d --no-build
 # Локально (з кореня репо, значення-заглушки):
 #   IMAGE_TAG=local DATABASE_URL=CHANGE_ME SMS_TOKEN=CHANGE_ME \
 #   SMS_BASE_URL=http://localhost:9001 COURIER_BASE_URL=http://localhost:9002 \
@@ -57,9 +57,10 @@ services:
   api:
     <<: *svc
     ports:
-      # Лише loopback: 8080 без TLS не відкриваємо в мережу; назовні — через reverse proxy з TLS на VM
-      # (припущення: у materials/ вхід не описано; без проксі тут має бути "8080:8080").
-      - "127.0.0.1:8080:8080"
+      # Поштомати й сканер служби доставки ходять до API мережею (docs/architecture.md), а reverse
+      # proxy з TLS на VM ніде не описаний — тому порт відкритий, як і до Task D. Окреме завдання:
+      # поставити проксі з TLS і тоді звузити до "127.0.0.1:8080:8080".
+      - "8080:8080"
     environment:
       <<: *env
       PORT: "8080"

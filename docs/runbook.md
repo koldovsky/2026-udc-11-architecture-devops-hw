@@ -5,13 +5,17 @@
 
 ## Звідки брати дані
 
-- **VM і compose.** Команди з `docker compose` — на VM `poshtomat-prod-1` у теці з репозиторієм
-  (там, де лежить `deploy/compose.yaml`; припущення: деплой іде з git-checkout на VM, бо compose
-  збирає образ з `../app`). У `docker compose logs` завжди додавайте `--no-log-prefix`: інакше
-  кожен рядок починається з `api-1  | ` і `cut -c…` нижче ріже не те.
-- **Історія розгортань** — файл `deploys.log` на VM (формат: `ts action version by note`; копія
-  за 14.10 — `incident/deploys.log`). Точного шляху на VM у наявних даних немає — **запишіть його
-  сюди після першого чергування**; до того: `find / -name deploys.log 2>/dev/null` на VM.
+- **VM і compose.** Усі команди `docker compose` нижче — на VM `poshtomat-prod-1` **з теки
+  `/opt/poshtomat`** (`cd /opt/poshtomat` один раз на початку), без `-f`. Саме туди
+  `pipeline/deploy.yml` кладе `compose.yaml` і там запускає compose, тож проєкт той самий —
+  `poshtomat`, а не окремий стек. Образ і тег поточного релізу (`IMAGE`, `IMAGE_TAG`) pipeline
+  записує в `/opt/poshtomat/.env` поруч із секретами, тому compose бере їх сам. Перевірка перед
+  першою дією: `docker compose ls` показує `poshtomat` з `/opt/poshtomat/compose.yaml`.
+  У `docker compose logs` завжди додавайте `--no-log-prefix`: інакше кожен рядок починається з
+  `api-1  | ` і `cut -c…` нижче ріже не те.
+- **Історія розгортань** — `/opt/poshtomat/deploys.log` (формат: `ts action version by note`;
+  кожен деплой дописує туди pipeline, у `note` — тег образу `sha-…`; копія за 14.10 —
+  `incident/deploys.log`).
 - **Метрики** — поштохвилинний CSV із моніторингу в тому самому форматі, що `incident/metrics/*.csv`
   (`ts,rps,p95_ms,error_rate,db_pool_in_use,db_pool_waiting,heap_used_pct,sms_429_per_min`).
   Вивантажте два файли: за сьогодні (`metrics-today.csv`) і за **вчора, той самий проміжок**
@@ -52,14 +56,14 @@
 1. **Підтвердіть сторінку в `#poshtomat-oncall`** («взяла/взяв, дивлюсь»).
 2. **Чи був деплой або рестарт за останні 2 години?** Це найсильніший сигнал.
    ```bash
-   tail -n 5 <шлях>/deploys.log
-   docker compose -f deploy/compose.yaml logs --no-log-prefix --since 2h api | grep -E 'service started|shutting down'
+   tail -n 5 deploys.log
+   docker compose logs --no-log-prefix --since 2h api | grep -E 'service started|shutting down'
    ```
    Є `deploy` / `service started` з новою версією за ≤ 30 хв до першої сторінки → **йдіть одразу
    в «Що робити», рядок 1 (відкат)**, діагностику — паралельно або після.
 3. **Що саме повертає API?** Типи помилок за останні 15 хв (кожна 5xx логується):
    ```bash
-   docker compose -f deploy/compose.yaml logs --no-log-prefix --since 15m api | grep -o '"error":"[^"]*"' | sort | uniq -c | sort -rn
+   docker compose logs --no-log-prefix --since 15m api | grep -o '"error":"[^"]*"' | sort | uniq -c | sort -rn
    ```
    - домінує `db pool wait timeout after 2000ms` → насичення пулу БД (→ «Діагностика», питання 1–3);
    - `Cannot read properties of undefined (reading 'trim')` — відомий фоновий дефект (≈ 125–130 за
@@ -79,13 +83,13 @@
 | Питання | Команда | Як читати результат |
 |---|---|---|
 | 1. Пул БД насичений? | `mstat metrics-today.csv db_pool_waiting <від> <до>; mstat metrics-today.csv db_pool_in_use <від> <до>` | `db_pool_waiting max > 0` — запити стоять у черзі на з'єднання. `db_pool_in_use` **весь час одне число** (min = max) — це стеля пулу. Далі — питання 2. |
-| 2. Яка стеля пулу в процесі насправді? | `docker compose -f deploy/compose.yaml exec api node --input-type=module -e 'import { loadConfig } from "./src/config.js"; const c = loadConfig(); console.log({ dbPoolMax: c.dbPoolMax, dbPoolWaitMs: c.dbPoolWaitMs })'` | Очікувано `dbPoolMax: 20`. **`4`** — застосунок не отримав `DB_POOL_MAX` і взяв дефолт для локальної розробки (так було 14.10). |
-| 3. Які змінні пулу реально задано контейнеру? | `docker compose -f deploy/compose.yaml exec api printenv \| grep -E '^DB_POOL'` | Має бути `DB_POOL_MAX=20` і `DB_POOL_WAIT_MS=2000`. Інша назва (`DB_POOL_SIZE`, одруківка) або відсутність → причина знайдена: розбіжність назв між `deploy/compose.yaml` і `app/src/config.js`. |
+| 2. Яка стеля пулу в процесі насправді? | `docker compose exec api node --input-type=module -e 'import { loadConfig } from "./src/config.js"; const c = loadConfig(); console.log({ dbPoolMax: c.dbPoolMax, dbPoolWaitMs: c.dbPoolWaitMs })'` | Очікувано `dbPoolMax: 20`. **`4`** — застосунок не отримав `DB_POOL_MAX` і взяв дефолт для локальної розробки (так було 14.10). |
+| 3. Які змінні пулу реально задано контейнеру? | `docker compose exec api printenv \| grep -E '^DB_POOL'` | Має бути `DB_POOL_MAX=20` і `DB_POOL_WAIT_MS=2000`. Інша назва (`DB_POOL_SIZE`, одруківка) або відсутність → причина знайдена: розбіжність назв між `deploy/compose.yaml` і `app/src/config.js`. |
 | 4. Чи зріс трафік? | `mstat metrics-today.csv rps <від> <до>; mstat metrics-yesterday.csv rps <від> <до>` | Різниця в межах ~10 % — навантаження звичайне, шукайте зміну в системі (деплой/конфіг). Помітно більше — реальний сплеск; при `dbPoolMax: 20` і `in_use = 20` → ескалація (рядок 3 «Що робити»). |
 | 5. Пул на 20 і все одно черга? | `mstat metrics-today.csv db_pool_in_use <від> <до>` | `max 20` + `db_pool_waiting > 0` при звичайному трафіку → повільні запити в PostgreSQL або блокування — ескалація до DBA (PostgreSQL на тій самій VM, поза compose). |
 | 6. SMS 429 — це нове? | `mstat metrics-today.csv sms_429_per_min <від> <до>; mstat metrics-yesterday.csv sms_429_per_min <від> <до>` | Схожі цифри (14.10 за 13:30–15:00: avg ≈ 34 / 13.10: ≈ 32) — щоденний шум. Worker — окремий процес із власним пулом, API до SMS-провайдера не звертається: 429 **не може** спричинити 503 в API. |
 | 7. Heap — витік? | `mstat metrics-today.csv heap_used_pct <від> <до>; mstat metrics-yesterday.csv heap_used_pct <від> <до>` — беріть проміжок **без рестартів API** (рестарт видно в кроці 2 «Перших 5 хвилин») | Пилка ≈54–82 % в обидва дні — норма (14.10 і 13.10 за 12:00–14:02: `min 54 max 82` / `min 55 max 82`). Рестарт скидає heap до ~42 %, тому проміжок із рестартом покаже нижчий `min` — це не ознака проблеми. Витік — це коли **мінімум** росте година за годиною без рестартів або процес падає з OOM. |
-| 8. Коли саме почалось? | `docker compose -f deploy/compose.yaml logs --no-log-prefix --since 2h api \| grep -m1 'db pool wait timeout' \| cut -c8-36` | Час першого таймауту пулу. Порівняйте з `service started` (крок 2 «Перших 5 хвилин»): секунди після старту нової версії → причина в релізі (14.10: старт `14:02:00`, перший таймаут `14:02:07`). |
+| 8. Коли саме почалось? | `docker compose logs --no-log-prefix --since 2h api \| grep -m1 'db pool wait timeout' \| cut -c8-36` | Час першого таймауту пулу. Порівняйте з `service started` (крок 2 «Перших 5 хвилин»): секунди після старту нової версії → причина в релізі (14.10: старт `14:02:00`, перший таймаут `14:02:07`). |
 
 ## Як підтвердити причину
 
@@ -103,11 +107,11 @@
 
 | Ситуація | Дія | Команда | Ризик / що перевірити після |
 |---|---|---|---|
-| 1. Сторінка ≤ 30 хв після деплою (незалежно від того, чи знайдено причину) | **Відкат на попередню версію.** Не чекайте відповіді зовнішніх провайдерів і не робіть рестарт тієї самої версії | `git fetch --tags && git checkout <попередній-тег>` (з `deploys.log`, напр. `v1.7.3`), потім `docker compose -f deploy/compose.yaml up -d --build`; перевірка: `docker compose -f deploy/compose.yaml logs --no-log-prefix --since 2m api \| grep 'service started'` | Відкат повертає і код, і `compose.yaml`. Переконайтесь, що в релізі немає міграцій БД (подивіться diff релізу); якщо є — ескалація до розробника перед відкатом. Після — розділ «Як переконатися». Напишіть у канал версію і час. |
-| 2. `dbPoolMax` ≠ 20 через неправильну назву змінної, а відкат неможливий | Виправити назву змінної в `deploy/compose.yaml` на ту, яку читає `app/src/config.js` (`DB_POOL_MAX`), і перестворити контейнери | `grep -n 'env\.' app/src/config.js` (які назви читає код) → виправити compose → `docker compose -f deploy/compose.yaml up -d` | Це ручна зміна в проді — зафіксуйте її в `deploys.log` і в каналі; той самий фікс має потрапити в репозиторій, інакше наступний деплой поверне проблему. Повторіть питання 2–3. |
+| 1. Сторінка ≤ 30 хв після деплою (незалежно від того, чи знайдено причину) | **Відкат на попередню версію.** Не чекайте відповіді зовнішніх провайдерів і не робіть рестарт тієї самої версії | **Основний шлях — той самий pipeline:** GitHub → Actions → «CI / Deploy» → Run workflow → «Use workflow from» = попередній тег (з `deploys.log`, напр. `v1.7.3`) → погодити environment `production`. Pipeline сам покладе `compose.yaml` цього тегу в `/opt/poshtomat` і перезапустить проєкт `poshtomat` (кілька хвилин: тести + збірка). **Швидше, вручну** (той самий проєкт): з ноутбука з репо спершу витягніть файл локально і лише тоді копіюйте **поруч**, а не поверх робочого: `git fetch --tags && git show <попередній-тег>:deploy/compose.yaml > compose.prev.yaml && test -s compose.prev.yaml && scp compose.prev.yaml poshtomat-prod-1:/opt/poshtomat/compose.prev.yaml` (помилка в назві тегу зупинить ланцюжок до `scp`). Далі на VM у `/opt/poshtomat`: `cp compose.yaml compose.bad.yaml && cp .env .env.bad && sed -i 's/^IMAGE_TAG=.*/IMAGE_TAG=<sha-тег попереднього рядка deploys.log>/' .env && docker compose -f compose.prev.yaml config -q && mv compose.prev.yaml compose.yaml && docker compose pull api worker && docker compose up -d --no-build` (`config -q` перевіряє файл до заміни; повернути як було — `mv compose.bad.yaml compose.yaml && mv .env.bad .env`). Перевірка: `docker compose ls` — лише `poshtomat`; `docker compose logs --no-log-prefix --since 2m api \| grep 'service started'` | Відкат повертає і образ, і `compose.yaml`. Не запускайте `docker compose -f deploy/compose.yaml …` з git-checkout: це інший проєкт (`deploy`), він підніме другий стек, а робочий лишиться на поганій версії. Ручний шлях можливий лише для релізів, задеплоєних цим pipeline (їхній образ `sha-…` є в GHCR). Переконайтесь, що в релізі немає міграцій БД (подивіться diff релізу); якщо є — ескалація до розробника перед відкатом. Після — розділ «Як переконатися». Напишіть у канал версію і час. |
+| 2. `dbPoolMax` ≠ 20 через неправильну назву змінної, а відкат неможливий | Виправити назву змінної в `/opt/poshtomat/compose.yaml` на ту, яку читає `src/config.js` (`DB_POOL_MAX`), і перестворити контейнери | `docker compose exec api grep -n 'env\.' src/config.js` (які назви читає код) → виправити `compose.yaml` → `docker compose up -d --no-build` | Це ручна зміна в проді — зафіксуйте її в `deploys.log` і в каналі; той самий фікс має потрапити в репозиторій, інакше наступний деплой поверне проблему. Повторіть питання 2–3. |
 | 3. Деплою не було, стеля 20, трафік вище звичайного | Тримати; ескалація до власника сервісу щодо тимчасового збільшення пулу (і перевірки `max_connections` PostgreSQL) | `mstat …` питання 4–5 кожні 5 хв | Збільшення пулу без перевірки PostgreSQL може перевантажити БД — лише разом із DBA. |
 | 4. Деплою не було, стеля 20, трафік звичайний | Ескалація до DBA: повільні запити / блокування | — (на боці PostgreSQL) | Рестарт API лише скине чергу на хвилину (див. 14:20 у `docs/rca.md`), але не виправить причину. |
-| 5. Лише `SmsProvider429RateHigh` без сторінок API | Порівняти з учора (питання 6); якщо так само — нічого не робити, лише нотатка в каналі | `docker compose -f deploy/compose.yaml logs --no-log-prefix --since 30m worker \| grep -cE 'sms (send\|delivery) failed'` (до v1.8.0 повідомлення називалось `sms send failed`, з v1.8.0 — `sms delivery failed`) | Звичайно — одиниці за день (14.10 і 13.10 — по 1 за 12:00–16:00). Зростання означає, що SMS не доходять → ескалація до розробника worker-а. |
+| 5. Лише `SmsProvider429RateHigh` без сторінок API | Порівняти з учора (питання 6); якщо так само — нічого не робити, лише нотатка в каналі | `docker compose logs --no-log-prefix --since 30m worker \| grep -cE 'sms (send\|delivery) failed'` (до v1.8.0 повідомлення називалось `sms send failed`, з v1.8.0 — `sms delivery failed`) | Звичайно — одиниці за день (14.10 і 13.10 — по 1 за 12:00–16:00). Зростання означає, що SMS не доходять → ескалація до розробника worker-а. |
 
 ## Коли ескалювати і кого кликати
 
@@ -127,7 +131,7 @@
 
 Протягом **5 хв** після дії (відкату чи виправлення):
 
-- `docker compose -f deploy/compose.yaml logs --no-log-prefix --since 5m api | grep -c 'db pool wait timeout'` → `0`.
+- `docker compose logs --no-log-prefix --since 5m api | grep -c 'db pool wait timeout'` → `0`.
 - Проба пулу з кроку 4 «Перших 5 хвилин» → `403` за десятки мілісекунд.
 - Метрики: `db_pool_waiting = 0`; `db_pool_in_use` знову **коливається** (у пік 10–13, а не одне
   й те саме число); `p95_ms` < 300 мс; `error_rate` < 0,01 (14.10 після відкату за 1–2 хв:

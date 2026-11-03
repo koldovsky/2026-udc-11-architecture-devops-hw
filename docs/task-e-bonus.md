@@ -5,7 +5,8 @@
 
 ## Шлях 1 — стек по-справжньому (Docker) — ✅ обраний шлях
 
-Перевірено 2026-11-02, Docker Desktop на Windows 11 (PowerShell), з кореня репо.
+Перевірено 2026-11-02, Docker Desktop на Windows 11 (PowerShell), з кореня репо; `ps` і `/health`
+повторно знято 2026-11-03 після того, як порт API повернули на `8080:8080` (логи — з 2026-11-02).
 
 - Команди, якими підняли стек (змінні задано через `$env:` у тій самій сесії PowerShell
   прямо перед `docker compose`, а не в `.env`; усі секрети — заглушки `CHANGE_ME`; список
@@ -34,14 +35,14 @@
 
   ```text
   NAME              IMAGE             COMMAND                  SERVICE   CREATED          STATUS                    PORTS
-  deploy-api-1      poshtomat:local   "docker-entrypoint.s…"   api       40 seconds ago   Up 40 seconds (healthy)   127.0.0.1:8080->8080/tcp
-  deploy-worker-1   poshtomat:local   "docker-entrypoint.s…"   worker    40 seconds ago   Up 40 seconds             8080/tcp
+  deploy-api-1      poshtomat:local   "docker-entrypoint.s…"   api       41 seconds ago   Up 40 seconds (healthy)   0.0.0.0:8080->8080/tcp, [::]:8080->8080/tcp
+  deploy-worker-1   poshtomat:local   "docker-entrypoint.s…"   worker    41 seconds ago   Up 40 seconds             8080/tcp
   ```
 
   Чому `worker` без healthcheck: `worker.js` не піднімає HTTP-сервера (`app/src/worker.js:40-58` —
   лише цикл опитування; `http.createServer`/`listen` є тільки в `app/src/server.js:93-95`), тож
   успадкований з образу `HEALTHCHECK` на `:8080/health` (`deploy/Dockerfile:18-19`) завжди падав би
-  і позначав його `unhealthy` — тому в `deploy/compose.yaml:73-76` стоїть `healthcheck: disable: true`.
+  і позначав його `unhealthy` — тому в `deploy/compose.yaml:74-77` стоїть `healthcheck: disable: true`.
   Для `api` окремого `healthcheck:` у compose немає — діє той самий `HEALTHCHECK` з образу
   (`docker inspect deploy-api-1 --format '{{json .Config.Healthcheck}}'` → `wget -qO- http://localhost:8080/health`,
   30s / 5s / 15s / 3); у worker `docker inspect` показує `"Test":["NONE"]`.
@@ -53,7 +54,7 @@
   > curl.exe -s -i http://localhost:8080/health
   HTTP/1.1 200 OK
   content-type: application/json; charset=utf-8
-  Date: Mon, 02 Nov 2026 15:04:07 GMT
+  Date: Tue, 03 Nov 2026 08:22:30 GMT
   Connection: keep-alive
   Keep-Alive: timeout=5
   Transfer-Encoding: chunked
