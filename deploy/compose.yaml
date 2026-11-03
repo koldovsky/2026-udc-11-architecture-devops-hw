@@ -1,35 +1,43 @@
-# Поштомат громади — продакшн на одній VM (docker compose up -d).
-# PostgreSQL працює на самій VM, поза compose.
 services:
   api:
-    image: poshtomat:latest
-    build:
-      context: ../app
-      dockerfile: ../deploy/Dockerfile
-    ports:
-      - "8080:8080"
-    environment:
-      TZ: "Europe/Kyiv"
+    image: ${IMAGE_NAME:?IMAGE_NAME is required}:${IMAGE_TAG:?IMAGE_TAG is required}
+    init: true
+    restart: unless-stopped
+    read_only: true
+    tmpfs: ["/tmp:size=16m,noexec,nosuid"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    pids_limit: 256
+    mem_limit: 512m
+    cpus: 1.0
+    ports: ["${API_BIND_ADDRESS:-127.0.0.1}:${API_PORT:-8080}:8080"]
+    environment: &app-env
+      TZ: ${TZ:-Europe/Kyiv}
       PORT: "8080"
-      LOG_LEVEL: "info"
-      DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
-      DB_POOL_MAX: "20"
-      DB_POOL_WAIT_MS: "2000"
-      SMS_BASE_URL: "https://sms.example.net/api/v2"
-      SMS_TOKEN: "CHANGE_ME"
-      SMS_RATE_PER_SEC: "20"
-      COURIER_BASE_URL: "https://courier.example.com/api/v1"
-
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+      DB_POOL_MAX: ${DB_POOL_MAX:-20}
+      DB_POOL_WAIT_MS: ${DB_POOL_WAIT_MS:-2000}
+      SMS_BASE_URL: ${SMS_BASE_URL:?SMS_BASE_URL is required}
+      SMS_TOKEN: ${SMS_TOKEN:?SMS_TOKEN is required}
+      SMS_RATE_PER_SEC: ${SMS_RATE_PER_SEC:-20}
+      COURIER_BASE_URL: ${COURIER_BASE_URL:?COURIER_BASE_URL is required}
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('node:http').get('http://127.0.0.1:8080/health',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      start_period: 10s
+      retries: 3
   worker:
-    image: poshtomat:latest
-    command: ["node", "src/worker.js"]
-    environment:
-      TZ: "Europe/Kyiv"
-      LOG_LEVEL: "info"
-      DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
-      DB_POOL_MAX: "20"
-      DB_POOL_WAIT_MS: "2000"
-      SMS_BASE_URL: "https://sms.example.net/api/v2"
-      SMS_TOKEN: "CHANGE_ME"
-      SMS_RATE_PER_SEC: "20"
-      COURIER_BASE_URL: "https://courier.example.com/api/v1"
+    image: ${IMAGE_NAME:?IMAGE_NAME is required}:${IMAGE_TAG:?IMAGE_TAG is required}
+    init: true
+    restart: unless-stopped
+    read_only: true
+    tmpfs: ["/tmp:size=16m,noexec,nosuid"]
+    security_opt: ["no-new-privileges:true"]
+    cap_drop: [ALL]
+    pids_limit: 256
+    mem_limit: 512m
+    cpus: 1.0
+    command: ["src/worker.js"]
+    environment: *app-env
