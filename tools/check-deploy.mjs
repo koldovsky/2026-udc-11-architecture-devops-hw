@@ -623,6 +623,31 @@ export const RULES = [
       return problems.length ? fail(`не закріплено: ${problems.join("; ")}`) : pass(`закріплено: ${count}`);
     },
   },
+  {
+    // Урок інциденту 2026-10-14: v1.8.0 перейменував DB_POOL_MAX → DB_POOL_SIZE у compose,
+    // config.js цієї змінної не читає, і пул упав до дефолтних 4 — мовчки. Правило ловить
+    // клас проблем «compose задає змінну, якої застосунок не знає» (перейменування,
+    // друкарська помилка, залишена після рефакторингу змінна).
+    id: "C5",
+    title: "Кожна змінна environment: у compose відома застосунку",
+    hint: "Застосунок читає налаштування лише через env.<NAME> в app/src/config.js. Змінна в environment:, якої там немає, — найчастіше перейменування або друкарська помилка (саме так DB_POOL_SIZE замість DB_POOL_MAX упустив пул з 20 до 4 в інциденті 2026-10-14): виправте ім'я або додайте читання змінної в config.js. Суто рантаймові змінні Node/ОС (TZ, NODE_ENV, NODE_OPTIONS, NODE_EXTRA_CA_CERTS) дозволені.",
+    check({ root, compose }) {
+      const problem = composeProblem(compose);
+      if (problem) return problem;
+      const configPath = join(root, "app/src/config.js");
+      if (!existsSync(configPath)) return skip("app/src/config.js не знайдено — немає з чим звіряти environment:");
+      const known = new Set([...readFileSync(configPath, "utf8").matchAll(/\benv\.([A-Za-z_][A-Za-z0-9_]*)/g)].map((m) => m[1]));
+      // змінні, які читає не config.js, а сам Node.js чи базовий образ
+      const RUNTIME_VARS = new Set(["TZ", "NODE_ENV", "NODE_OPTIONS", "NODE_EXTRA_CA_CERTS"]);
+      const problems = [];
+      for (const [name, svc] of services(compose)) {
+        for (const [key] of envEntries(svc?.environment)) {
+          if (!known.has(key) && !RUNTIME_VARS.has(key)) problems.push(`${name}: ${key} — застосунок цієї змінної не читає`);
+        }
+      }
+      return problems.length ? fail(problems.join("; ")) : pass("усі змінні environment: читає app/src/config.js (або це рантаймові TZ/NODE_*)");
+    },
+  },
 ];
 
 // ---------------------------------------------------------------- running

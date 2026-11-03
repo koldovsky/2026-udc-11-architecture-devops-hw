@@ -1,0 +1,136 @@
+# CI/CD поштомата: тести → збірка і публікація образу → деплой на VM.
+# У репозиторії GitHub цей файл має лежати в .github/workflows/deploy.yml.
+#
+# Ручне погодження: job deploy прив'язано до environment "production" —
+# у Settings → Environments → production увімкніть Required reviewers,
+# і деплой стартує лише після явного approve.
+#
+# Потрібні секрети (Settings → Secrets and variables → Actions):
+#   DEPLOY_HOST, DEPLOY_USER, DEPLOY_SSH_KEY, DEPLOY_KNOWN_HOSTS,
+#   DATABASE_URL, SMS_TOKEN. GITHUB_TOKEN видає сам GitHub.
+
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# За замовчуванням — жодних прав; кожен job розширює їх точково.
+permissions: {}
+
+# Деплої не йдуть паралельно і не скасовують один одного посеред процесу.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Run unit tests
+        working-directory: app
+        run: npm test   # залежностей немає, npm install не потрібен
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write   # push у GHCR; більше нічого
+    outputs:
+      image: ${{ steps.meta.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image name (GHCR вимагає нижній регістр)
+        id: meta
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}:${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: app
+          file: deploy/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.image }}
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # Ручне погодження: job чекає approve від Required reviewers environment-а.
+    environment:
+      name: production
+    permissions:
+      contents: read
+    env:
+      IMAGE: ${{ needs.build.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Prepare SSH
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_ed25519
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/id_ed25519 ~/.ssh/known_hosts
+
+      - name: Copy compose file to the VM
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" 'mkdir -p /opt/poshtomat'
+          scp deploy/compose.yaml "$DEPLOY_USER@$DEPLOY_HOST:/opt/poshtomat/compose.yaml"
+
+      # Секрети їдуть через stdin у .env з правами 600 — вони не потрапляють
+      # ні в командний рядок (видимий у ps), ні в логи workflow.
+      - name: Write runtime .env on the VM
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SMS_TOKEN: ${{ secrets.SMS_TOKEN }}
+        run: |
+          printf 'IMAGE=%s\nDATABASE_URL=%s\nSMS_TOKEN=%s\n' \
+            "$IMAGE" "$DATABASE_URL" "$SMS_TOKEN" \
+            | ssh "$DEPLOY_USER@$DEPLOY_HOST" 'umask 077 && cat > /opt/poshtomat/.env'
+
+      - name: Pull image and restart services
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" \
+            | ssh "$DEPLOY_USER@$DEPLOY_HOST" "docker login ghcr.io -u '$GHCR_USER' --password-stdin"
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" \
+            'cd /opt/poshtomat && docker compose pull --quiet && docker compose up -d --remove-orphans && docker logout ghcr.io'
+
+      - name: Smoke check /health
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          ssh "$DEPLOY_USER@$DEPLOY_HOST" \
+            'for i in $(seq 1 10); do curl -fsS http://localhost:8080/health && exit 0; sleep 3; done; echo "health check failed" >&2; exit 1'

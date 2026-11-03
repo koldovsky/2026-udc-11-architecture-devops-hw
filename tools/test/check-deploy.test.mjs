@@ -332,6 +332,7 @@ test("the CLI prints a row per rule, survives broken YAML and exits 1 on failure
       D1: "PASS", D2: "PASS", D3: "FAIL", D4: "PASS",
       C1: "PASS", C2: "PASS", C3: "PASS", C4: "PASS",
       W1: "FAIL", W2: "SKIP", W3: "SKIP", W4: "SKIP", W5: "SKIP",
+      C5: "SKIP", // the fixture has no app/src/config.js to compare environment: against
     });
     assert.match(out, /W1 +FAIL .*не розібрався як YAML/);
     assert.match(out, /підказка:/);

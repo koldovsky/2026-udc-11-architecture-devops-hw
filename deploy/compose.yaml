@@ -1,35 +1,70 @@
 # Поштомат громади — продакшн на одній VM (docker compose up -d).
 # PostgreSQL працює на самій VM, поза compose.
+#
+# Секретів у цьому файлі немає: DATABASE_URL і SMS_TOKEN compose читає
+# зі змінних оточення або з .env поруч із файлом (деплой кладе його з
+# GitHub Secrets, права 600). Якщо змінну не задано — compose падає одразу
+# (синтаксис ${VAR:?...}), а не стартує з CHANGE_ME.
+#
+# IMAGE задає деплой (ghcr.io/<repo>:<sha>) через .env на VM; локально:
+#   IMAGE=poshtomat:dev docker compose -f deploy/compose.yaml up -d --build
+# Без IMAGE compose не стартує (${IMAGE:?…}) — щоб «випадковий latest» був неможливий.
+
+x-app-env: &app-env
+  TZ: "Europe/Kyiv"
+  LOG_LEVEL: "info"
+  DATABASE_URL: "${DATABASE_URL:?DATABASE_URL is required}"
+  DB_POOL_MAX: "20"
+  DB_POOL_WAIT_MS: "2000"
+  SMS_BASE_URL: "https://sms.example.net/api/v2"
+  SMS_TOKEN: "${SMS_TOKEN:?SMS_TOKEN is required}"
+  # Ліміт облікового запису в провайдера — 10 повідомлень/с (materials/vendors/sms-provider.md):
+  # 20 давало щоденний шум 429 у пообідній пік (див. docs/rca.md, чинники).
+  SMS_RATE_PER_SEC: "10"
+  COURIER_BASE_URL: "https://courier.example.com/api/v1"
+
+x-hardening: &hardening
+  image: "${IMAGE:?IMAGE is required, e.g. ghcr.io/<owner>/poshtomat:<sha> or poshtomat:dev}"
+  init: true                      # коректний PID 1: сигнали й зомбі-процеси
+  restart: unless-stopped         # переживає ребут VM і падіння процесу
+  read_only: true                 # сервіс нічого не пише на диск
+  tmpfs:
+    - /tmp
+  security_opt:
+    - no-new-privileges:true
+  cap_drop:
+    - ALL
+  logging:                        # щоб логи не з'їли диск VM
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+
 services:
   api:
-    image: poshtomat:latest
+    <<: *hardening
     build:
       context: ../app
       dockerfile: ../deploy/Dockerfile
     ports:
       - "8080:8080"
     environment:
-      TZ: "Europe/Kyiv"
+      <<: *app-env
       PORT: "8080"
-      LOG_LEVEL: "info"
-      DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
-      DB_POOL_MAX: "20"
-      DB_POOL_WAIT_MS: "2000"
-      SMS_BASE_URL: "https://sms.example.net/api/v2"
-      SMS_TOKEN: "CHANGE_ME"
-      SMS_RATE_PER_SEC: "20"
-      COURIER_BASE_URL: "https://courier.example.com/api/v1"
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
 
   worker:
-    image: poshtomat:latest
+    <<: *hardening
     command: ["node", "src/worker.js"]
-    environment:
-      TZ: "Europe/Kyiv"
-      LOG_LEVEL: "info"
-      DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
-      DB_POOL_MAX: "20"
-      DB_POOL_WAIT_MS: "2000"
-      SMS_BASE_URL: "https://sms.example.net/api/v2"
-      SMS_TOKEN: "CHANGE_ME"
-      SMS_RATE_PER_SEC: "20"
-      COURIER_BASE_URL: "https://courier.example.com/api/v1"
+    environment: *app-env
+    healthcheck:
+      disable: true               # HEALTHCHECK з Dockerfile б'є в HTTP-порт, який worker не слухає
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
