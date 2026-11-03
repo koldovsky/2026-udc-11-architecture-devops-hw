@@ -1,0 +1,127 @@
+# Скопіюйте у .github/workflows/deploy.yml — GitHub читає workflow лише звідти.
+#
+# Потрібно налаштувати в репозиторії:
+#   Environment `production` → Required reviewers (це і є ручне погодження).
+#   Secrets (environment production): DEPLOY_HOST, DEPLOY_USER, DEPLOY_SSH_KEY,
+#     DEPLOY_KNOWN_HOSTS (вивід `ssh-keyscan <host>`), SMS_TOKEN.
+#   Variable: DEPLOY_PATH — тека на VM, напр. /opt/poshtomat.
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Тести
+        working-directory: app
+        run: npm test
+      - name: Перевірки деплою (змінні compose читаються в config.js та інші правила)
+        run: npm run test:tools && npm run check:deploy
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.ref.outputs.image }}@${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Ім'я образу (ghcr вимагає нижній регістр)
+        id: ref
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Збірка і push
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: app
+          file: deploy/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.ref.outputs.image }}:${{ github.sha }}
+            ${{ steps.ref.outputs.image }}:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production # зупиняється до погодження рецензентом
+    permissions:
+      contents: read
+      packages: read
+    env:
+      IMAGE: ${{ needs.build.outputs.image }}
+      DEPLOY_PATH: ${{ vars.DEPLOY_PATH }}
+      DEPLOY_TARGET: ${{ secrets.DEPLOY_USER }}@${{ secrets.DEPLOY_HOST }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: SSH
+        env:
+          SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$SSH_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<EOF
+          Host deploy
+            HostName ${DEPLOY_TARGET#*@}
+            User ${DEPLOY_TARGET%@*}
+            IdentityFile ~/.ssh/id_deploy
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+          EOF
+      - name: Передати compose.yaml
+        run: ssh deploy "cat > '$DEPLOY_PATH/compose.yaml'" < deploy/compose.yaml
+      - name: Передати конфіг (секрети йдуть через stdin, не через аргументи)
+        env:
+          SMS_TOKEN: ${{ secrets.SMS_TOKEN }}
+        run: |
+          printf 'IMAGE=%s\nSMS_TOKEN=%s\n' "$IMAGE" "$SMS_TOKEN" \
+            | ssh deploy "umask 077; cat > '$DEPLOY_PATH/.env'"
+      - name: Вхід у реєстр на VM
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | ssh deploy "docker login ghcr.io -u '$GHCR_USER' --password-stdin"
+      - name: Оновити сервіси
+        run: |
+          ssh deploy "cd '$DEPLOY_PATH' && docker compose pull && docker compose up -d --remove-orphans --wait --wait-timeout 120"
+      - name: Вийти з реєстру на VM
+        if: always()
+        run: ssh deploy "docker logout ghcr.io"

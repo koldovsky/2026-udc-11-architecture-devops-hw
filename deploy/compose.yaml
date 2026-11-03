@@ -1,35 +1,52 @@
 # Поштомат громади — продакшн на одній VM (docker compose up -d).
 # PostgreSQL працює на самій VM, поза compose.
+#
+# Потрібні змінні (pipeline пише їх у .env поруч із цим файлом):
+#   IMAGE      — образ з реєстру, бажано за digest (ghcr.io/org/poshtomat@sha256:...)
+#   SMS_TOKEN  — токен SMS-провайдера
+x-common: &common
+  image: ${IMAGE:?IMAGE is required}
+  restart: unless-stopped
+  init: true
+  stop_grace_period: 20s
+  read_only: true
+  tmpfs:
+    - /tmp
+  cap_drop: [ALL]
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 128
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+  environment: &env
+    TZ: "Europe/Kyiv"
+    LOG_LEVEL: "info"
+    DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
+    DB_POOL_MAX: "20"
+    DB_POOL_WAIT_MS: "2000"
+    SMS_BASE_URL: "https://sms.example.net/api/v2"
+    SMS_TOKEN: ${SMS_TOKEN:?SMS_TOKEN is required}
+    SMS_RATE_PER_SEC: "20"
+    COURIER_BASE_URL: "https://courier.example.com/api/v1"
+
 services:
   api:
-    image: poshtomat:latest
-    build:
-      context: ../app
-      dockerfile: ../deploy/Dockerfile
+    <<: *common
     ports:
       - "8080:8080"
     environment:
-      TZ: "Europe/Kyiv"
+      <<: *env
       PORT: "8080"
-      LOG_LEVEL: "info"
-      DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
-      DB_POOL_MAX: "20"
-      DB_POOL_WAIT_MS: "2000"
-      SMS_BASE_URL: "https://sms.example.net/api/v2"
-      SMS_TOKEN: "CHANGE_ME"
-      SMS_RATE_PER_SEC: "20"
-      COURIER_BASE_URL: "https://courier.example.com/api/v1"
+    mem_limit: 512m
+    cpus: 1.0
 
   worker:
-    image: poshtomat:latest
+    <<: *common
     command: ["node", "src/worker.js"]
-    environment:
-      TZ: "Europe/Kyiv"
-      LOG_LEVEL: "info"
-      DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
-      DB_POOL_MAX: "20"
-      DB_POOL_WAIT_MS: "2000"
-      SMS_BASE_URL: "https://sms.example.net/api/v2"
-      SMS_TOKEN: "CHANGE_ME"
-      SMS_RATE_PER_SEC: "20"
-      COURIER_BASE_URL: "https://courier.example.com/api/v1"
+    healthcheck:
+      disable: true # worker не слухає порт
+    mem_limit: 256m
+    cpus: 0.5

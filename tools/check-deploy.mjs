@@ -379,6 +379,27 @@ function oneShot(svc) {
   return String(svc?.restart ?? "") === "no" || svc?.deploy?.restart_policy?.condition === "none";
 }
 
+// Where the service reads its settings, and the variables nobody has to read there:
+// TZ and NODE_* are consumed by the Node.js runtime itself, not by config.js.
+const CONFIG_PATH = "app/src/config.js";
+const RUNTIME_ENV = /^(?:TZ|NODE_[A-Z0-9_]+)$/;
+
+/**
+ * Names that a config module reads from `env` (`env.NAME`, `process.env.NAME`,
+ * `env["NAME"]`). Comments are dropped first, string literals are left alone, so a
+ * name that only appears in a comment, or a `//` inside a URL, changes nothing.
+ */
+export function configEnvNames(source) {
+  const code = String(source).replace(
+    /("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`)|\/\/[^\n]*|\/\*[\s\S]*?\*\//g,
+    (whole, literal) => literal ?? "",
+  );
+  const names = new Set();
+  for (const m of code.matchAll(/\benv\s*\.\s*([A-Za-z_]\w*)/g)) names.add(m[1]);
+  for (const m of code.matchAll(/\benv\s*\[\s*(["'])([A-Za-z_]\w*)\1\s*\]/g)) names.add(m[2]);
+  return names;
+}
+
 export const RULES = [
   {
     id: "D1",
@@ -621,6 +642,25 @@ export const RULES = [
         }
       }
       return problems.length ? fail(`не закріплено: ${problems.join("; ")}`) : pass(`закріплено: ${count}`);
+    },
+  },
+  {
+    id: "K1",
+    title: "Змінні оточення з compose читаються в app/src/config.js",
+    hint: "Змінна, яку config.js не читає, ігнорується мовчки, а застосунок бере дефолт (так DB_POOL_SIZE замість DB_POOL_MAX лишив пул на 4 з'єднаннях). Виправте ім'я в compose на те, що читає app/src/config.js, або додайте читання в config.js. TZ і NODE_* перевіряти не треба — їх читає рантайм. Змінні сервісів не з нашого образу (база, проксі) винесіть в env_file: — його вміст не перевіряється.",
+    check({ compose, root }) {
+      const problem = composeProblem(compose);
+      if (problem) return problem;
+      const file = join(root, CONFIG_PATH);
+      if (!existsSync(file)) return fail(`${CONFIG_PATH} не знайдено`);
+      const read = configEnvNames(readFileSync(file, "utf8"));
+      const problems = [];
+      for (const [name, svc] of services(compose)) {
+        for (const [key] of envEntries(svc?.environment)) {
+          if (!RUNTIME_ENV.test(key) && !read.has(key)) problems.push(`${name}: ${key} — config.js її не читає`);
+        }
+      }
+      return problems.length ? fail(problems.join("; ")) : pass("кожну змінну з compose читає config.js (TZ і NODE_* — рантайм)");
     },
   },
 ];
