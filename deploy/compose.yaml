@@ -1,35 +1,91 @@
-# Поштомат громади — продакшн на одній VM (docker compose up -d).
+# Поштомат громади — продакшн на одній VM.
 # PostgreSQL працює на самій VM, поза compose.
+#
+# Образ збирає і публікує pipeline; на VM нічого не збирається. Поруч із цим файлом лежить
+# .env (режим 600), який записує деплой: POSHTOMAT_IMAGE, DATABASE_URL, SMS_TOKEN.
+# У репозиторій .env не потрапляє.
+#
+# Нічна задача (cron на VM) бере той самий образ і оточення:
+#   cd /opt/poshtomat && docker compose run --rm -T worker node bin/expire-parcels.js
+name: poshtomat
+
+x-service: &service
+  image: ${POSHTOMAT_IMAGE:?POSHTOMAT_IMAGE is required}
+  restart: unless-stopped
+  init: true
+  read_only: true
+  tmpfs:
+    - /tmp:size=16m
+  cap_drop:
+    - ALL
+  security_opt:
+    - no-new-privileges:true
+  pids_limit: 128
+  # Логи йдуть у stdout; без ротації вони з часом заповнять диск VM.
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "5"
+
+x-env: &env
+  TZ: "Europe/Kyiv"
+  LOG_LEVEL: "info"
+  DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is required}
+  DB_POOL_MAX: "20"
+  DB_POOL_WAIT_MS: "2000"
+
+# Мережа навмисно стандартна: контейнерам потрібен вихід до PostgreSQL на VM і до
+# зовнішніх API, тому internal: true зламав би сервіс.
 services:
   api:
-    image: poshtomat:latest
-    build:
-      context: ../app
-      dockerfile: ../deploy/Dockerfile
+    <<: *service
     ports:
       - "8080:8080"
+    mem_limit: 512m
+    stop_grace_period: 15s
     environment:
-      TZ: "Europe/Kyiv"
+      <<: *env
       PORT: "8080"
-      LOG_LEVEL: "info"
-      DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
-      DB_POOL_MAX: "20"
-      DB_POOL_WAIT_MS: "2000"
-      SMS_BASE_URL: "https://sms.example.net/api/v2"
-      SMS_TOKEN: "CHANGE_ME"
-      SMS_RATE_PER_SEC: "20"
-      COURIER_BASE_URL: "https://courier.example.com/api/v1"
+    # /health не звертається до БД: перевірка показує, що процес живий, але не що БД доступна.
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - fetch('http://127.0.0.1:8080/health').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
   worker:
-    image: poshtomat:latest
+    <<: *service
     command: ["node", "src/worker.js"]
+    mem_limit: 256m
+    # Після SIGTERM worker завершує поточну партію SMS і паузу 10 с між опитуваннями.
+    # Стандартних 10 с замало: SIGKILL посеред партії означає повторні SMS.
+    stop_grace_period: 30s
+    # HTTP у worker немає, тож перевіряємо, що в контейнері працює саме його процес: це ловить
+    # падіння під час старту (up --wait і відкат). Зависання не ловить: для цього потрібен
+    # heartbeat у коді застосунку.
+    healthcheck:
+      test:
+        - CMD
+        - node
+        - -e
+        - const fs=require('fs');process.exit(fs.readdirSync('/proc').some(p=>{try{return fs.readFileSync('/proc/'+p+'/cmdline','latin1').split('\0')[1]==='src/worker.js'}catch{return false}})?0:1)
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
     environment:
-      TZ: "Europe/Kyiv"
-      LOG_LEVEL: "info"
-      DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
-      DB_POOL_MAX: "20"
-      DB_POOL_WAIT_MS: "2000"
+      <<: *env
       SMS_BASE_URL: "https://sms.example.net/api/v2"
-      SMS_TOKEN: "CHANGE_ME"
-      SMS_RATE_PER_SEC: "20"
+      SMS_TOKEN: ${SMS_TOKEN:?SMS_TOKEN is required}
+      # Ліміт провайдера — 10 SMS/с, понад нього 429 (ADR-0001, рішення 4). Темп діє на процес,
+      # тому worker один. 5/с вистачає: у денний пік іде близько 3 SMS/с.
+      SMS_RATE_PER_SEC: "5"
+      # Сам worker його не використовує, але без нього нічна задача, запущена через
+      # "run worker", піде на http://localhost:9002 уже після того, як позначить посилку повернутою.
       COURIER_BASE_URL: "https://courier.example.com/api/v1"

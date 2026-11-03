@@ -15,7 +15,7 @@
 // tools/test/<name>.test.mjs (npm run test:tools runs only tools/test/*.test.mjs).
 
 import { execSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -379,6 +379,22 @@ function oneShot(svc) {
   return String(svc?.restart ?? "") === "no" || svc?.deploy?.restart_policy?.condition === "none";
 }
 
+const APP_CODE_DIRS = ["app/src", "app/bin"];
+// Read by the OS or by Node itself, so our code never mentions them.
+const RUNTIME_ENV = new Set(["TZ", "NODE_ENV", "NODE_OPTIONS", "NODE_EXTRA_CA_CERTS"]);
+
+/** Names the app reads as env.NAME / process.env.NAME; comments do not count. Empty when there is no code. */
+export function envNamesReadByApp(root) {
+  const names = new Set();
+  for (const dir of APP_CODE_DIRS.map((d) => join(root, d)).filter((d) => existsSync(d))) {
+    for (const file of readdirSync(dir, { recursive: true }).filter((f) => /\.m?js$/.test(f))) {
+      const code = readFileSync(join(dir, file), "utf8").replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "");
+      for (const [, name] of code.matchAll(/\benv\.([A-Z][A-Z0-9_]*)\b/g)) names.add(name);
+    }
+  }
+  return names;
+}
+
 export const RULES = [
   {
     id: "D1",
@@ -621,6 +637,20 @@ export const RULES = [
         }
       }
       return problems.length ? fail(`не закріплено: ${problems.join("; ")}`) : pass(`закріплено: ${count}`);
+    },
+  },
+  {
+    id: "E1",
+    title: "Кожну змінну з environment: у compose читає код застосунку",
+    hint: "Змінну, якої код не читає, сервіс мовчки ігнорує і бере значення за замовчуванням: так пул з'єднань упав із 20 до 4 в інциденті 14.10. Звірте назву з app/src/config.js: перейменуйте її в compose.yaml назад або змініть код разом із нею. Застарілу змінну приберіть.",
+    check({ compose, root }) {
+      const problem = composeProblem(compose);
+      if (problem) return problem;
+      const read = envNamesReadByApp(root);
+      if (!read.size) return skip(`у ${APP_CODE_DIRS.join(", ")} не знайдено читання змінних оточення — немає з чим звіряти`);
+      const entries = services(compose).flatMap(([name, svc]) => envEntries(svc?.environment).map(([key]) => [name, key]));
+      const unknown = entries.filter(([, key]) => !read.has(key) && !RUNTIME_ENV.has(key)).map(([name, key]) => `${name}: ${key}`);
+      return unknown.length ? fail(`код не читає: ${unknown.join("; ")}`) : pass(`звірено змінних: ${entries.length}`);
     },
   },
 ];
