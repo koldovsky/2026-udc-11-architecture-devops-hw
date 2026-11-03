@@ -7,7 +7,7 @@
 #
 # Порядок:
 #   1. перевірити середовище (curl, compose з up --wait-timeout) і compose.yaml.new (config -q,
-#      лише https:// для зовнішніх API, DB_POOL_MAX задано числом), стягнути образ — робочий
+#      стягнути образ; у api і worker — https:// для зовнішніх API і DB_POOL_MAX числом) — робочий
 #      compose.yaml ще не чіпаємо;
 #   2. зберегти робочий файл як compose.yaml.prev, підмінити, up --wait (api має стати healthy);
 #   3. функціональна перевірка: розмір пулу в api і worker = DB_POOL_MAX, проба через пул api,
@@ -27,18 +27,37 @@ docker compose up --help | grep -q -- --wait-timeout || fail 'docker compose н�
 
 export IMAGE="$new_image" IMAGE_TAG="$new_tag"
 docker compose -f compose.yaml.new config -q
-# app/ схему URL не перевіряє, а SMS_TOKEN іде в заголовку Authorization (app/src/sms.js:33).
-# Дозволено лише https:// (у будь-якому регістрі); http://, HTTP:// чи інша схема — стоп.
-if docker compose -f compose.yaml.new config | grep '_BASE_URL: ' | grep -Eqiv '_BASE_URL: .?https://'; then
-  fail 'SMS_BASE_URL і COURIER_BASE_URL на проді мають бути https://'
-fi
-# Скільки з'єднань пулу задає compose: з ним після старту звіряємо те, що взяв застосунок.
-want_pool=$(docker compose -f compose.yaml.new config | sed -n 's/^ *DB_POOL_MAX: "\{0,1\}\([0-9][0-9]*\)"\{0,1\} *$/\1/p' | sort -u)
-case "$want_pool" in
-  '' | *[!0-9]*) fail "DB_POOL_MAX у compose.yaml.new не задано одним числом для всіх сервісів: '${want_pool//$'\n'/ }'" ;;
-esac
-want_pool=$((10#$want_pool))
 docker compose -f compose.yaml.new pull --quiet api worker
+
+# Змінні, які мусять бути в кожного з api і worker, — з розібраної конфігурації (config --format
+# json), а не з рядків виводу: відсутня змінна в одному сервісі теж зупиняє деплой. Розбирає JSON
+# node з образу релізу (на VM може не бути jq), без мережі.
+#  - SMS_BASE_URL і COURIER_BASE_URL — лише https:// (будь-який регістр): app/ схему не перевіряє,
+#    а SMS_TOKEN іде в заголовку Authorization (app/src/sms.js:33);
+#  - DB_POOL_MAX — одне число для обох: з ним після старту звіряємо пул, який узяв застосунок.
+want_pool=$(docker compose -f compose.yaml.new config --format json |
+  docker run --rm -i --network none --entrypoint node "$IMAGE:$IMAGE_TAG" -e '
+    const cfg = JSON.parse(require("fs").readFileSync(0, "utf8"));
+    const problems = [];
+    const pools = new Set();
+    for (const svc of ["api", "worker"]) {
+      const env = cfg.services?.[svc]?.environment ?? {};
+      for (const name of ["SMS_BASE_URL", "COURIER_BASE_URL"]) {
+        const value = env[name];
+        if (typeof value !== "string" || value === "") problems.push(`${svc}: ${name} не задано`);
+        else if (!/^https:\/\//i.test(value)) problems.push(`${svc}: ${name} — не https://`);
+      }
+      const pool = String(env.DB_POOL_MAX ?? "");
+      if (/^[0-9]+$/.test(pool)) pools.add(Number(pool));
+      else problems.push(`${svc}: DB_POOL_MAX не задано числом`);
+    }
+    if (pools.size > 1) problems.push(`DB_POOL_MAX різний у сервісах: ${[...pools].join(", ")}`);
+    if (problems.length) {
+      console.error(problems.join("; "));
+      process.exit(1);
+    }
+    console.log([...pools][0]);
+  ') || fail 'змінні оточення в compose.yaml.new не пройшли перевірку (причина — рядком вище)'
 
 # Функціональна перевірка нового релізу. HEALTHCHECK (/health) пулу не торкається, тож healthy
 # ще не означає, що API обслуговує запити (docs/rca.md, доказ 15).
