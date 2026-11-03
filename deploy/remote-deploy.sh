@@ -80,6 +80,7 @@ smoke() {
 }
 
 rollback() {
+  trap - EXIT HUP INT TERM
   echo "deploy: $1 — повертаю попередній compose.yaml і образ з .env" >&2
   if [ -f compose.yaml.prev ]; then mv compose.yaml.prev compose.yaml; fi
   unset IMAGE IMAGE_TAG
@@ -88,6 +89,13 @@ rollback() {
 }
 
 if [ -f compose.yaml ]; then cp compose.yaml compose.yaml.prev; fi
+# Від підміни compose.yaml до фіксації .env будь-який вихід, крім успішного, — це відкат: явна
+# помилка, `set -e`, сигнал (HUP — розірвана ssh-сесія, INT, TERM) чи збій запису в закритий stdout.
+# SIGKILL перехопити неможливо — тоді відкат вручну (docs/runbook.md, «Що робити», рядок 1).
+trap 'rollback "деплой перервано (код $?)"' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 mv compose.yaml.new compose.yaml
 deploy_started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 docker compose up -d --remove-orphans --no-build --wait --wait-timeout 120 || rollback 'api не став healthy за 120 с'
@@ -104,6 +112,8 @@ write_env() {
     mv .env.tmp .env
 }
 write_env || { rm -f .env.tmp; rollback 'не вдалося записати .env'; }
+# Реліз зафіксовано (compose.yaml і .env узгоджені) — далі перерваний скрипт нічого не відкочує.
+trap - EXIT HUP INT TERM
 # Журнал — для людей; збій запису в нього не скасовує вже перевірений і зафіксований у .env реліз.
 printf '%s   deploy    %s   %s   image %s, run %s\n' "$(date -Iseconds)" "$ref" "$actor" "$IMAGE_TAG" "$run_id" >> deploys.log ||
   echo 'deploy: УВАГА — реліз працює, але рядок у deploys.log не записано' >&2
