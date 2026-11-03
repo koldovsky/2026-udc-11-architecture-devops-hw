@@ -60,15 +60,20 @@ smoke() {
     [ "$code" = 403 ] || { echo "deploy: проба пулу api — HTTP ${code:-000} замість 403" >&2; return 1; }
   done
   # worker: за 25 с проходить щонайменше один цикл опитування (раз на 10 с); він має працювати
-  # без перезапусків, стартувати і не мати жодного «notify round failed».
+  # без перезапусків, стартувати і не мати жодного «notify round failed» за час цього деплою.
+  # Лог беремо не весь: якщо compose не перестворив worker (той самий образ і конфіг), у ньому
+  # лишаються записи давніх запусків — давня помилка не має валити справний деплой, а давній
+  # «worker started» — підтверджувати старт.
   sleep 25
   id=$(docker compose ps -q worker)
   [ -n "$id" ] || { echo 'deploy: контейнера worker немає' >&2; return 1; }
-  [ "$(docker inspect -f '{{.State.Running}} {{.RestartCount}}' "$id")" = "true 0" ] ||
-    { echo 'deploy: worker не працює або перезапускався' >&2; return 1; }
-  docker compose logs --no-log-prefix worker | grep -q '"worker started"' ||
-    { echo 'deploy: у лозі worker немає «worker started»' >&2; return 1; }
-  if docker compose logs --no-log-prefix worker | grep -q 'notify round failed'; then
+  local state started
+  state=$(docker inspect -f '{{.State.Running}} {{.RestartCount}} {{.State.StartedAt}}' "$id")
+  started=${state##* }
+  [ "${state% *}" = "true 0" ] || { echo 'deploy: worker не працює або перезапускався' >&2; return 1; }
+  docker compose logs --no-log-prefix --since "$started" worker | grep -q '"worker started"' ||
+    { echo 'deploy: у лозі поточного запуску worker немає «worker started»' >&2; return 1; }
+  if docker compose logs --no-log-prefix --since "$deploy_started" worker | grep -q 'notify round failed'; then
     echo 'deploy: worker пише «notify round failed»' >&2
     return 1
   fi
@@ -84,6 +89,7 @@ rollback() {
 
 if [ -f compose.yaml ]; then cp compose.yaml compose.yaml.prev; fi
 mv compose.yaml.new compose.yaml
+deploy_started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 docker compose up -d --remove-orphans --no-build --wait --wait-timeout 120 || rollback 'api не став healthy за 120 с'
 smoke || rollback 'функціональна перевірка не пройшла'
 
