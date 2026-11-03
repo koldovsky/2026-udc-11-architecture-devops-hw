@@ -5,13 +5,13 @@ on:
     tags: ['v[0-9]*.[0-9]*.[0-9]*']
   workflow_dispatch:
 
-# Least privilege by default; jobs widen only what they need (build: packages: write).
+# Мінімальні права за замовчуванням; job розширює лише потрібне (build: packages: write).
 permissions:
   contents: read
 
 jobs:
 
-  # ─── 1. Tests ───────────────────────────────────────────────────────────────
+  # ─── 1. Тести ───────────────────────────────────────────────────────────────
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -28,7 +28,7 @@ jobs:
 
       - run: npm test
 
-  # ─── 2. Build & push image ──────────────────────────────────────────────────
+  # ─── 2. Збірка й публікація образу ──────────────────────────────────────────────────
   build:
     name: Build & push image
     needs: test
@@ -36,13 +36,13 @@ jobs:
     timeout-minutes: 20
     permissions:
       contents: read
-      packages: write        # push to GHCR via GITHUB_TOKEN
+      packages: write        # пуш у GHCR через GITHUB_TOKEN
     outputs:
       tag: ${{ steps.tag.outputs.value }}
     steps:
       - uses: actions/checkout@v4
 
-      # The one place the deploy tag is defined: metadata-action and the deploy job both use it.
+      # Єдине місце, де визначено тег деплою: його беруть і metadata-action, і job deploy.
       - id: tag
         run: echo "value=sha-${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
 
@@ -58,7 +58,7 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
-          # Never push :latest — deploys always use the explicit sha tag.
+          # :latest не пушимо — деплой завжди йде за явним sha-тегом.
           flavor: latest=false
           tags: |
             type=raw,value=${{ steps.tag.outputs.value }}
@@ -75,29 +75,33 @@ jobs:
           cache-to: type=gha,mode=max
           provenance: false
 
-  # ─── 3. Deploy (requires manual approval via environment protection rule) ───
+  # ─── 3. Деплой (ручне схвалення через правило захисту environment) ───
   deploy:
     name: Deploy to production
     needs: build
-    # Only a release tag (push) or main (workflow_dispatch) may reach production;
-    # a manual run on any other branch still tests and builds, but does not deploy.
+    # На прод потрапляє лише тег релізу (push) або main (workflow_dispatch);
+    # ручний запуск з іншої гілки тестує й збирає, але не деплоїть.
     if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/main'
-    # Never cancel an in-flight production deploy; tests and builds of other runs stay parallel.
+    # Деплой на прод, що вже йде, не скасовуємо; тести й збірки інших запусків ідуть паралельно.
     concurrency:
       group: deploy-production
       cancel-in-progress: false
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    environment: production   # → Settings › Environments › production: add required reviewers
+    environment: production   # → Settings › Environments › production: додати required reviewers
     env:
       IMAGE: ghcr.io/${{ github.repository }}
       IMAGE_TAG: ${{ needs.build.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
 
-      # All DEPLOY_* secrets are read here once and turned into the ssh host alias `prod`;
-      # the steps below are plain scp/ssh. DEPLOY_KNOWN_HOSTS = `ssh-keyscan -p <port> <host>`
-      # output checked by hand once — the host key is verified, not trusted on first use.
+      # metadata-action пушить назву образу в нижньому регістрі; стягуємо саме її.
+      - name: Normalize image name
+        run: echo "IMAGE=${IMAGE,,}" >> "$GITHUB_ENV"
+
+      # Усі секрети DEPLOY_* читаються тут один раз і стають ssh-аліасом `prod`;
+      # далі — звичайні scp/ssh. DEPLOY_KNOWN_HOSTS — вивід `ssh-keyscan -p <port> <host>`,
+      # один раз перевірений вручну: ключ хоста звіряється, а не приймається при першому з'єднанні.
       - name: Configure SSH access
         env:
           DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
@@ -106,8 +110,6 @@ jobs:
           DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
           DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
         run: |
-          # metadata-action pushes a lowercase image name; pull exactly that.
-          echo "IMAGE=${IMAGE,,}" >> "$GITHUB_ENV"
           install -m 700 -d ~/.ssh
           install -m 600 /dev/null ~/.ssh/deploy_key
           printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
@@ -122,14 +124,13 @@ jobs:
             StrictHostKeyChecking yes
           EOF
 
-      # Push the latest compose file to the server.
+      # Скопіювати актуальний compose-файл на сервер.
       - name: Upload compose file
         run: scp deploy/compose.yaml prod:/opt/poshtomat/compose.yaml
 
-      # Pull the new image and recreate containers (short downtime while compose recreates them).
-      # GHCR_TOKEN is a PAT with packages:read scope, stored in repo secrets. It goes to the
-      # remote docker login through stdin (never as a CLI arg), so it does not appear in the
-      # remote process list or shell history.
+      # Стягнути новий образ і перестворити контейнери (короткий простій, поки compose їх перестворює).
+      # GHCR_TOKEN — PAT з правом packages:read у секретах репо. Він іде у віддалений docker login
+      # через stdin (не аргументом), тож не видний у списку процесів і в історії shell на сервері.
       - name: Pull image and restart services
         env:
           GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}

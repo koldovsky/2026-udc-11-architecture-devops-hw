@@ -37,7 +37,9 @@ function checkTree(files) {
   }
 }
 
-const composeWithPool = (poolVar) =>
+// withDb: api is built from app/ and a third-party postgres service sits next to it
+// (worker runs the same image as api, so it still counts as an app service).
+const composeWithPool = (poolVar, { withDb = false } = {}) =>
   [
     "x-env: &env",
     "  TZ: \"Europe/Kyiv\"",
@@ -46,6 +48,7 @@ const composeWithPool = (poolVar) =>
     "services:",
     "  api:",
     "    image: poshtomat:1.8.0",
+    ...(withDb ? ["    build:", "      context: ../app"] : []),
     "    environment:",
     "      <<: *env",
     "      PORT: \"8080\"",
@@ -53,6 +56,16 @@ const composeWithPool = (poolVar) =>
     "    image: poshtomat:1.8.0",
     "    environment:",
     "      <<: *env",
+    ...(withDb
+      ? [
+          "  db:",
+          "    image: postgres:16.4",
+          "    environment:",
+          "      POSTGRES_DB: poshtomat",
+          "      POSTGRES_USER: poshtomat",
+          "      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}",
+        ]
+      : []),
     "",
   ].join("\n");
 
@@ -127,33 +140,11 @@ test("C5 SKIPs when there is no app source to compare against", () => {
 // (POSTGRES_*) are read by that image, not by our app. Only services built from app/ (or
 // running the same image as one) are checked; a typo in the app service is still caught.
 test("C5 ignores a third-party service but still checks the app services next to it", () => {
-  const compose = (poolVar) =>
-    [
-      "x-app: &app",
-      "  image: poshtomat:1.7.3",
-      "  build:",
-      "    context: ../app",
-      "services:",
-      "  api:",
-      "    <<: *app",
-      "    environment:",
-      `      ${poolVar}: "20"`,
-      "  worker:",
-      "    image: poshtomat:1.7.3",
-      "    environment:",
-      `      ${poolVar}: "20"`,
-      "  db:",
-      "    image: postgres:16.4",
-      "    environment:",
-      "      POSTGRES_DB: poshtomat",
-      "      POSTGRES_USER: poshtomat",
-      "      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?}",
-      "",
-    ].join("\n");
-  const ok = checkTree({ "deploy/compose.yaml": compose("DB_POOL_MAX"), "app/src/config.js": CONFIG_JS });
+  const ok = checkTree({ "deploy/compose.yaml": composeWithPool("DB_POOL_MAX", { withDb: true }), "app/src/config.js": CONFIG_JS });
   assert.equal(ok.status, "PASS", ok.message);
-  assert.match(ok.message, /записів environment: 2 у сервісах api, worker \(унікальних назв: 1\); сторонні образи не перевірялись: db/);
-  const bad = checkTree({ "deploy/compose.yaml": compose("DB_POOL_SIZE"), "app/src/config.js": CONFIG_JS });
+  // api 4 entries (TZ, LOG_LEVEL, DB_POOL_MAX, PORT) + worker 3; db is not counted
+  assert.match(ok.message, /записів environment: 7 у сервісах api, worker \(унікальних назв: 4\); сторонні образи не перевірялись: db/);
+  const bad = checkTree({ "deploy/compose.yaml": composeWithPool("DB_POOL_SIZE", { withDb: true }), "app/src/config.js": CONFIG_JS });
   assert.equal(bad.status, "FAIL");
   assert.match(bad.message, /api: DB_POOL_SIZE; worker: DB_POOL_SIZE$/); // worker shares the image of api
   assert.doesNotMatch(bad.message, /POSTGRES/);

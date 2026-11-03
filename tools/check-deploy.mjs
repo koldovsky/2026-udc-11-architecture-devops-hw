@@ -579,7 +579,7 @@ export const RULES = [
   {
     id: "C5",
     title: "Кожну змінну оточення з compose застосунок справді читає",
-    hint: "Назва змінної в environment: має збігатися з тією, яку читає код (env.NAME в app/src або app/bin) — інакше значення мовчки ігнорується і працює дефолт. Змінні рантайму Node (TZ, NODE_OPTIONS) і сервіси зі стороннім образом не перевіряються.",
+    hint: `Назва змінної в environment: має збігатися з тією, яку читає код (env.NAME в app/src або app/bin) — інакше значення мовчки ігнорується і працює дефолт. Змінні рантайму Node (${[...RUNTIME_ENV].join(", ")}) і сервіси зі стороннім образом не перевіряються.`,
     check({ compose, root }) {
       const problem = composeProblem(compose);
       if (problem) return problem;
@@ -593,9 +593,9 @@ export const RULES = [
       }
       if (problems.length) return fail(`застосунок не читає (значення мовчки ігнорується): ${problems.join("; ")}`);
       const unique = new Set(keys.map(([, key]) => key)).size;
-      const names = (list) => list.map(([name]) => name).join(", ");
-      const others = thirdPartyServices.length ? `; сторонні образи не перевірялись: ${names(thirdPartyServices)}` : "";
-      return pass(`записів environment: ${keys.length} у сервісах ${names(appServices)} (унікальних назв: ${unique})${others}`);
+      const serviceNames = (entries) => entries.map(([name]) => name).join(", ");
+      const skippedNote = thirdPartyServices.length ? `; сторонні образи не перевірялись: ${serviceNames(thirdPartyServices)}` : "";
+      return pass(`записів environment: ${keys.length} у сервісах ${serviceNames(appServices)} (унікальних назв: ${unique})${skippedNote}`);
     },
   },
   {

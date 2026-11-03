@@ -34,7 +34,7 @@ x-svc: &svc
   # IMAGE — щоб той самий файл працював і локально (poshtomat, зібраний тут), і на проді
   # (ghcr.io/<org>/<repo>, куди пушить pipeline/deploy.yml).
   image: ${IMAGE:-poshtomat}:${IMAGE_TAG:?IMAGE_TAG must be set — never deploy :latest}
-  # Paths are relative to this file: context = app/, Dockerfile = deploy/Dockerfile.
+  # Шляхи — відносно цього файлу: context = app/, Dockerfile = deploy/Dockerfile.
   build:
     context: ../app
     dockerfile: ../deploy/Dockerfile
@@ -70,7 +70,7 @@ services:
     command: ["node", "src/worker.js"]
     environment:
       <<: *env
-    # The worker has no HTTP server and no ports: the image's HEALTHCHECK
-    # (GET :8080/health) would always fail here and mark it unhealthy.
+    # У worker немає HTTP-сервера і портів: HEALTHCHECK з образу (GET :8080/health)
+    # тут завжди падав би і позначав сервіс unhealthy.
     healthcheck:
       disable: true

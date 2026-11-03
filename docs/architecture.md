@@ -5,6 +5,8 @@
 > «Стрілки і докази». Рядки коду перевірено `grep -n` / `cat -n` у поточному стані `app/`.
 > Розгортання береться з compose.yaml до змін Task D (гілка main):
 > `git show main:deploy/compose.yaml`.
+> Обидві діаграми рендеряться без помилок: кожен блок `mermaid` винесено в окремий файл і
+> прогнано через `npx @mermaid-js/mermaid-cli` 12.2.0 (`mmdc -i d1.mmd -o d1.svg`, так само `d2`) — exit 0, SVG створено.
 
 ## Рівень 1 — System Context
 

@@ -2,14 +2,14 @@ FROM node:22-alpine
 
 WORKDIR /app
 
-# Explicit COPY instead of "COPY . ." — test/ and docs/ stay out of the image.
+# Явний COPY замість "COPY . ." — test/ і docs/ не потрапляють в образ.
 COPY package.json ./
 COPY src/          ./src/
 COPY bin/          ./bin/
 
 ENV NODE_ENV=production
-# All runtime secrets (DATABASE_URL, SMS_TOKEN, …) come from the container
-# environment at runtime — nothing sensitive is baked into the image.
+# Усі секрети (DATABASE_URL, SMS_TOKEN, …) приходять зі змінних оточення контейнера
+# під час запуску — в образ нічого чутливого не запікається.
 
 EXPOSE 8080
 

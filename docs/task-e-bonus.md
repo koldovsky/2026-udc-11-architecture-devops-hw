@@ -7,8 +7,9 @@
 
 Перевірено 2026-11-02, Docker Desktop на Windows 11 (PowerShell), з кореня репо.
 
-- Команди, якими підняли стек (змінні — у команді, не в закоміченому `.env`; усі секрети —
-  заглушки `CHANGE_ME`; список обов'язкових змінних — у шапці `deploy/compose.yaml:5-10`):
+- Команди, якими підняли стек (змінні задано через `$env:` у тій самій сесії PowerShell
+  прямо перед `docker compose`, а не в `.env`; усі секрети — заглушки `CHANGE_ME`; список
+  обов'язкових змінних — у шапці `deploy/compose.yaml:5-10`):
 
   ```powershell
   $env:IMAGE_TAG='local'; $env:DATABASE_URL='CHANGE_ME'; $env:SMS_TOKEN='CHANGE_ME'; `
