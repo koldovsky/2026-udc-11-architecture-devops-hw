@@ -67,10 +67,13 @@ smoke() {
   sleep 25
   id=$(docker compose ps -q worker)
   [ -n "$id" ] || { echo 'deploy: контейнера worker немає' >&2; return 1; }
-  local state started
-  state=$(docker inspect -f '{{.State.Running}} {{.RestartCount}} {{.State.StartedAt}}' "$id")
-  started=${state##* }
-  [ "${state% *}" = "true 0" ] || { echo 'deploy: worker не працює або перезапускався' >&2; return 1; }
+  local running restarts started allowed=0
+  read -r running restarts started < <(docker inspect -f '{{.State.Running}} {{.RestartCount}} {{.State.StartedAt}}' "$id")
+  # Той самий контейнер, що й до деплою (compose його не перестворив), — рахуємо лише перезапуски
+  # після `up`; новий контейнер не мав перезапускатися взагалі.
+  if [ "$id" = "$worker_before" ]; then allowed=$restarts_before; fi
+  [ "$running" = true ] && [ "$restarts" = "$allowed" ] ||
+    { echo "deploy: worker не працює або перезапускався під час деплою (перезапусків: $restarts, до деплою: $allowed)" >&2; return 1; }
   docker compose logs --no-log-prefix --since "$started" worker | grep -q '"worker started"' ||
     { echo 'deploy: у лозі поточного запуску worker немає «worker started»' >&2; return 1; }
   if docker compose logs --no-log-prefix --since "$deploy_started" worker | grep -q 'notify round failed'; then
@@ -89,6 +92,12 @@ rollback() {
 }
 
 if [ -f compose.yaml ]; then cp compose.yaml compose.yaml.prev; fi
+# Який worker працює зараз і скільки разів він уже перезапускався — щоб smoke рахував лише нові.
+worker_before=$(docker compose ps -q worker 2>/dev/null || true)
+restarts_before=0
+if [ -n "$worker_before" ]; then
+  restarts_before=$(docker inspect -f '{{.RestartCount}}' "$worker_before" 2>/dev/null || echo 0)
+fi
 # Від підміни compose.yaml до фіксації .env будь-який вихід, крім успішного, — це відкат: явна
 # помилка, `set -e`, сигнал (HUP — розірвана ssh-сесія, INT, TERM) чи збій запису в закритий stdout.
 # SIGKILL перехопити неможливо — тоді відкат вручну (docs/runbook.md, «Що робити», рядок 1).
