@@ -99,7 +99,10 @@
 
 ### Кандидат на детерміноване правило (для Task D)
 
-**Action item #1.** Правило читає лише файли репо, без мережі і без запуску застосунку:
+**Action item #1.** Правило читає лише файли репо й не запускає застосунок. Мережа потрібна один раз:
+`deploy/compose.yaml` розбирає `npx --yes yaml@2.8.1` (`parseYaml` у `tools/check-deploy.mjs`), і поки
+пакета немає в npm-кеші, без мережі перевіряльник замість результату дає FAIL з поясненням (`toolError`);
+далі — з кешу, без мережі:
 
 - **Що інспектує:** `deploy/compose.yaml` → `services.<кожен>.environment` (ключі map або
   `NAME=…` зі списку, після розкриття `<<: *env`) сервісів застосунку і `app/src/**` +
@@ -174,7 +177,7 @@
 **Як перевірити:**
 
 ```bash
-npm run test:tools        # 6 тестів C5 у tools/test/compose-env.test.mjs, усі зелені
+npm run test:tools        # 9 тестів C5 у tools/test/compose-env.test.mjs, усі зелені
 npm run check:deploy      # C5 PASS: записів environment: 19 у сервісах api, worker (унікальних назв: 10)
 # відтворити v1.8.0 у копії поза репо:
 T=$(mktemp -d) && cp -r deploy pipeline app "$T"/ \

@@ -16,7 +16,7 @@ flowchart LR
   delivery(["Служба доставки — сканер<br/>[Person / зовнішній оператор]"])
   staff(["Персонал<br/>[Person, роль staff/admin]"])
   screen["Екран поштомата<br/>[External System]"]
-  monitor["Моніторинг: хтось, хто опитує /health<br/>[External System, у коді не названий]"]
+  monitor(["Черговий / оператор — перевіряє /health вручну<br/>[Person; автоматичного монітора в репо немає]"])
 
   system["Поштомат громади<br/>[Software System]<br/>реєстрація посилок, SMS з кодом, видача за кодом, повернення через 72 год"]
 
@@ -27,7 +27,7 @@ flowchart LR
   resident -->|"C2: вводить 6-значний код"| screen
   screen -->|"C3: надсилає код, POST /pickup, HTTP/JSON"| system
   staff -->|"C4: дивиться список, GET /admin/parcels, Bearer-сесія"| system
-  monitor -->|"C5: перевірка стану, GET /health"| system
+  monitor -->|"C5: перевірка стану вручну, GET /health"| system
   system -->|"C6: просить надіслати SMS, POST /messages, Bearer SMS_TOKEN"| sms
   sms -->|"C7: SMS з кодом отримання"| resident
   system -->|"C8: просить забрати неотриману посилку, POST /returns, HTTP/JSON"| courier
@@ -41,7 +41,7 @@ flowchart LR
   delivery(["Служба доставки — сканер<br/>[Person]"])
   staff(["Персонал<br/>[Person]"])
   screen["Екран поштомата<br/>[External System]"]
-  monitor["Моніторинг<br/>[External System, у коді не названий]"]
+  monitor(["Черговий / оператор<br/>[Person, вручну]"])
   sms["SMS-провайдер<br/>[External System]"]
   courier["Кур'єрська компанія — API повернень<br/>[External System]"]
 
@@ -56,7 +56,7 @@ flowchart LR
   delivery -->|"K1: POST /parcels, HTTP/JSON"| api
   screen -->|"K2: POST /pickup з кодом, HTTP/JSON"| api
   staff -->|"K3: GET /admin/parcels, Authorization: Bearer"| api
-  monitor -->|"K4: GET /health"| api
+  monitor -->|"K4: GET /health вручну"| api
   api -->|"K5: пише й читає посилки, пише події, читає сесії, через пул"| db
   worker -->|"K6: читає несповіщені, ставить notifiedAt"| db
   worker -->|"K7: POST /messages, Bearer, ретраї на 429"| sms
@@ -117,7 +117,7 @@ K* — проти Container кожного прогону. **є** — AI нам�
 | C2 | Мешканець → Екран поштомата: вводить код (6 цифр) | `app/src/parcels.js:58`, `app/src/parcels.js:60` | є (`:43`; але «4-значний» — у коді 6 цифр, `app/src/parcels.js:27`) | є (`:44`) |
 | C3 | Екран поштомата → Поштомат: `POST /pickup` з кодом, HTTP/JSON | `app/src/server.js:42-44`, `app/src/parcels.js:58` | є (`:44`) | є (`:42`) |
 | C4 | Персонал → Поштомат: `GET /admin/parcels`, `Authorization: Bearer <сесія>`, лише staff/admin | `app/src/server.js:47-48`, `app/src/server.js:16-18`, `app/src/parcels.js:73` | є (`:45`) | є (`:43`) |
-| C5 | Моніторинг → Поштомат: `GET /health` | `app/src/server.js:37` (ендпоінт), `app/src/server.js:75` (`/health` виключено з access-логу) | є (`:48`) | пропустив |
+| C5 | Черговий / оператор → Поштомат: `GET /health` вручну | ендпоінт — `app/src/server.js:37` (`server.js:75` — виключено з access-логу); хто викликає — `incident/oncall-chat.md:17` (черговий дивиться `/health` під час інциденту), `docs/ops/backup-runbook.md:35` (перевірка після відновлення). Автоматичного монітора, що опитує `/health`, у `deploy/`, `pipeline/`, `materials/` немає | є (`:48`) | пропустив |
 | C6 | Поштомат → SMS-провайдер: `POST {SMS_BASE_URL}/messages`, Bearer `SMS_TOKEN` | `app/src/sms.js:31-34`, `app/src/config.js:11-12` | є (`:46`) | є (`:45`) |
 | C7 | SMS-провайдер → Мешканець: SMS «Посилка чекає… Код: …» на `recipientPhone` | `app/src/worker.js:28`, `app/src/worker.js:12` | пропустив (замість неї — `Поштомат → Мешканець` напряму, `:47`, див. «вигадав») | пропустив |
 | C8 | Поштомат → Кур'єрська компанія: `POST {COURIER_BASE_URL}/returns`, причина `not_picked_up_72h` | `app/src/courier.js:7-8`, `app/src/courier.js:14`, `app/bin/expire-parcels.js:15` | пропустив | є (`:46`; ціль — «Служба доставки», злита зі сканером) |
@@ -129,7 +129,7 @@ K* — проти Container кожного прогону. **є** — AI нам�
 | K1 | Служба доставки → API: `POST /parcels`, HTTP/JSON | `app/src/server.js:38-39` | є (`:79`) | є (`:77`) |
 | K2 | Екран поштомата → API: `POST /pickup`, HTTP/JSON | `app/src/server.js:42-44` | є (`:80`) | є (`:78`) |
 | K3 | Персонал → API: `GET /admin/parcels`, Bearer | `app/src/server.js:47-48`, `app/src/server.js:16` | є (`:81`) | є (`:79`) |
-| K4 | Моніторинг → API: `GET /health` | `app/src/server.js:37` | є (`:82`) | пропустив |
+| K4 | Черговий / оператор → API: `GET /health` вручну | `app/src/server.js:37` (ендпоінт); викликач — як у C5: `incident/oncall-chat.md:17`, `docs/ops/backup-runbook.md:35` | є (`:82`) | пропустив |
 | K5 | API → БД: пише й читає посилки, пише подію `picked_up`, лише читає сесії (`findSession`) — через пул | `app/src/parcels.js:43-44`, `app/src/parcels.js:61-67`, `app/src/parcels.js:74`, `app/src/server.js:18`, `app/src/server.js:91` | є (`:84`) | є (`:81`) |
 | K6 | SMS-воркер → БД: `listUnnotified(50)`, потім `notifiedAt` | `app/src/worker.js:24`, `app/src/worker.js:33`, `app/src/worker.js:9` | є (`:85`) | є (`:82`) |
 | K7 | SMS-воркер → SMS-провайдер: `POST /messages`, Bearer, темп `SMS_RATE_PER_SEC`, ретраї на 429 | `app/src/worker.js:28`, `app/src/sms.js:31-33`, `app/src/sms.js:36-40` | є (`:86`) | є (`:83`) |

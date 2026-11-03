@@ -97,6 +97,7 @@
 | 15 | `/health` не торкається БД, тому 200 під час інциденту нічого не доводив | `grep -n '"/health"' app/src/server.js` | `37:    if (method === "GET" && path === "/health") return [200, { status: "ok", version }];` · `75:    else if (path !== "/health" && …` (у лог не потрапляє) |
 | 16 | Масштаб: ≈3,4 тис. 5xx з ≈31,9 тис. запитів за 14:02–14:47 (13.10 — 57) | `for f in incident/metrics/2026-10-14.csv incident/baseline/metrics-2026-10-13.csv; do node -e 'const [file, from, to] = process.argv.slice(1); const [head, ...rows] = require("fs").readFileSync(file, "utf8").trim().split("\n"); const h = head.split(","); const R = h.indexOf("rps"), E = h.indexOf("error_rate"); let req = 0, err = 0; for (const r of rows.map((x) => x.split(","))) if (r[0].slice(11, 16) >= from && r[0].slice(11, 16) < to) { req += r[R] * 60; err += r[R] * 60 * r[E]; } console.log(file, from + "-" + to, "requests~", Math.round(req), "5xx~", Math.round(err), "share", (err / req * 100).toFixed(1) + "%");' $f 14:02 14:47; done` | `incident/metrics/2026-10-14.csv 14:02-14:47 requests~ 31866 5xx~ 3432 share 10.8%` · `incident/baseline/metrics-2026-10-13.csv 14:02-14:47 requests~ 31992 5xx~ 57 share 0.2%` |
 | 17 | Умова warning-алерту про SMS 429 виконується щодня в той самий час — це шум, а не сигнал інциденту | `for f in incident/metrics/2026-10-14.csv incident/baseline/metrics-2026-10-13.csv; do node -e 'const [head, ...rows] = require("fs").readFileSync(process.argv[1], "utf8").trim().split("\n"); const i = head.split(",").indexOf("sms_429_per_min"); let run = 0, first = null; for (const r of rows.map((x) => x.split(","))) { run = +r[i] > 20 ? run + 1 : 0; if (run === 5 && !first) first = r[0]; } console.log(process.argv[1], "sms_429>20 for 5 min first at", first);' $f; done` | `incident/metrics/2026-10-14.csv sms_429>20 for 5 min first at 2026-10-14T13:36:00+03:00` · `incident/baseline/metrics-2026-10-13.csv sms_429>20 for 5 min first at 2026-10-13T13:36:00+03:00` |
+| 18 | За 14.10 спрацювали лише три алерти, і жоден не стосується пулу БД. Це експорт алертів інциденту; правил моніторингу в репо немає, тож перевірено лише записи інциденту, а не конфігурацію моніторингу | `grep -o '"condition": "[^"]*"' incident/alerts.json; grep -ci pool incident/alerts.json` | `"condition": "sms_429_per_min > 20 протягом 5 хв"` · `"condition": "p95_ms > 2000 протягом 3 хв"` · `"condition": "error_rate > 0.05 протягом 3 хв"` · `0` |
 
 ## Що з даних НЕ є причиною — і чим це доведено
 
@@ -140,8 +141,9 @@
   цього вікна.
 - **`/health` не відображає стан залежностей** (пулу/БД, доказ 15) — 200 давав хибне відчуття
   «з процесом усе гаразд».
-- **Немає алерту на насичення пулу** (`db_pool_waiting > 0` або `db_pool_in_use` = максимум), хоча
-  метрика показала проблему вже в хвилину 14:02 (доказ 8); сторінки прийшли через 4–5 хв за
+- **Немає алерту на насичення пулу** (`db_pool_waiting > 0` або `db_pool_in_use` = максимум): серед алертів
+  14.10 такого немає (доказ 18; правил моніторингу в репо немає — перевірено лише експорт алертів інциденту),
+  хоча метрика показала проблему вже у хвилину 14:02 (доказ 8); сторінки прийшли через 4–5 хв за
   вторинними симптомами (латентність, 5xx).
 - **Шумний щоденний warning `SmsProvider429RateHigh`** (доказ 17) і одиночний TLS-таймаут відвели
   увагу на хибний слід. Worker на `main` налаштований на `SMS_RATE_PER_SEC: "20"`, тоді як ліміт облікового запису —

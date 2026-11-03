@@ -14,7 +14,9 @@
 #      worker через 25 с запущений без нових перезапусків, вивів «worker started» і не записав
 #      «notify round failed»;
 #   4. лише після успіху атомарно записати IMAGE/IMAGE_TAG у .env і рядок у deploys.log.
-# Будь-який збій на кроках 2–3 → повертаємо compose.yaml.prev і образ з .env, вихід ≠ 0.
+# Будь-який збій на кроках 2–3 → повертаємо compose.yaml.prev і образ з .env, вихід ≠ 0; на першому
+# деплої (compose.yaml.prev немає) — зупиняємо стек. Переривання вже після запису .env — реліз
+# лишається (він пройшов перевірку), вихід ≠ 0.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -33,7 +35,8 @@ docker compose -f compose.yaml.new pull --quiet api worker
 # Змінні, які мусять бути в кожного з api і worker, — з розібраної конфігурації (config --format
 # json), а не з рядків виводу: відсутня змінна в одному сервісі теж зупиняє деплой. Розбирає JSON
 # node з образу релізу (на VM може не бути jq), без мережі.
-#  - SMS_BASE_URL і COURIER_BASE_URL — лише https:// (будь-який регістр): app/ схему не перевіряє,
+#  - SMS_BASE_URL і COURIER_BASE_URL — розібрані як URL: схема https (будь-який регістр) і
+#    непорожнє ім'я хоста (`https://` чи `https://:443` не проходять): app/ URL не перевіряє,
 #    а SMS_TOKEN іде в заголовку Authorization (app/src/sms.js:33);
 #  - DB_POOL_MAX — одне число для обох: з ним після старту звіряємо пул, який узяв застосунок.
 want_pool=$(docker compose -f compose.yaml.new config --format json |
@@ -45,8 +48,17 @@ want_pool=$(docker compose -f compose.yaml.new config --format json |
       const env = cfg.services?.[svc]?.environment ?? {};
       for (const name of ["SMS_BASE_URL", "COURIER_BASE_URL"]) {
         const value = env[name];
-        if (typeof value !== "string" || value === "") problems.push(`${svc}: ${name} не задано`);
-        else if (!/^https:\/\//i.test(value)) problems.push(`${svc}: ${name} — не https://`);
+        if (typeof value !== "string" || value === "") {
+          problems.push(`${svc}: ${name} не задано`);
+          continue;
+        }
+        let url = null;
+        try {
+          url = new URL(value);
+        } catch {}
+        if (!url) problems.push(`${svc}: ${name} — не URL`);
+        else if (url.protocol !== "https:") problems.push(`${svc}: ${name} — не https://`);
+        else if (!url.hostname) problems.push(`${svc}: ${name} — без імені хоста`);
       }
       const pool = String(env.DB_POOL_MAX ?? "");
       if (/^[0-9]+$/.test(pool)) pools.add(Number(pool));
@@ -96,23 +108,56 @@ smoke() {
   if [ "$id" = "$worker_before" ]; then allowed=$restarts_before; fi
   [ "$running" = true ] && [ "$restarts" = "$allowed" ] ||
     { echo "deploy: worker не працює або перезапускався під час деплою (перезапусків: $restarts, до деплою: $allowed)" >&2; return 1; }
-  docker compose logs --no-log-prefix --since "$started" worker | grep -q '"worker started"' ||
+  # Лог спершу в змінну, потім grep: у конвеєрі `logs | grep -q` grep виходить на першому збігу,
+  # compose отримує SIGPIPE, і через pipefail увесь конвеєр — «невдача» навіть при збігу.
+  local run_log deploy_log
+  run_log=$(docker compose logs --no-log-prefix --since "$started" worker) ||
+    { echo 'deploy: не вдалося прочитати лог worker' >&2; return 1; }
+  deploy_log=$(docker compose logs --no-log-prefix --since "$deploy_started" worker) ||
+    { echo 'deploy: не вдалося прочитати лог worker' >&2; return 1; }
+  grep -q '"worker started"' <<<"$run_log" ||
     { echo 'deploy: у лозі поточного запуску worker немає «worker started»' >&2; return 1; }
-  if docker compose logs --no-log-prefix --since "$deploy_started" worker | grep -q 'notify round failed'; then
+  if grep -q 'notify round failed' <<<"$deploy_log"; then
     echo 'deploy: worker пише «notify round failed»' >&2
     return 1
   fi
 }
 
+# .env уже містить новий IMAGE/IMAGE_TAG (а не проміжний .env.tmp)?
+env_has_new_release() {
+  [ ! -e .env.tmp ] && grep -qxF "IMAGE=$new_image" .env 2>/dev/null && grep -qxF "IMAGE_TAG=$new_tag" .env 2>/dev/null
+}
+
+phase=verify # verify — до кінця smoke; commit — запис .env (smoke пройшов)
 rollback() {
   trap - EXIT HUP INT TERM
-  echo "deploy: $1 — повертаю попередній compose.yaml і образ з .env" >&2
-  if [ -f compose.yaml.prev ]; then mv compose.yaml.prev compose.yaml; fi
+  # Сигнал у фазі запису міг прийти вже після `mv .env.tmp .env`: тоді .env узгоджений з новим
+  # compose.yaml, і повертати старий файл означало б старий compose з новим тегом. Стан фіксації
+  # визначає сам .env, а не прапорець після mv (той міг не встигнути встановитися).
+  if [ "$phase" = commit ] && env_has_new_release; then
+    echo "deploy: $1 — але .env уже записано: реліз $new_tag лишається (перевірку він пройшов)" >&2
+    printf '%s   deploy    %s   %s   image %s, run %s (перервано після запису .env)\n' \
+      "$(date -Iseconds)" "$ref" "$actor" "$new_tag" "$run_id" >> deploys.log || true
+    exit 1
+  fi
   unset IMAGE IMAGE_TAG
-  docker compose up -d --remove-orphans --no-build || echo 'deploy: відкат не вдався — див. docs/runbook.md' >&2
+  if [ -f compose.yaml.prev ]; then
+    echo "deploy: $1 — повертаю попередній compose.yaml і образ з .env" >&2
+    mv compose.yaml.prev compose.yaml
+    docker compose up -d --remove-orphans --no-build || echo 'deploy: відкат не вдався — див. docs/runbook.md' >&2
+  else
+    # Перший деплой: попереднього релізу немає, повертати нічого. Зупиняємо стек, щоб зламаний
+    # реліз не лишився запущеним; його compose зберігаємо як compose.yaml.failed для розбору.
+    echo "deploy: $1 — це перший деплой, попереднього релізу немає: зупиняю стек" >&2
+    IMAGE=$new_image IMAGE_TAG=$new_tag docker compose down --remove-orphans ||
+      echo 'deploy: не вдалося зупинити стек — docker compose down вручну' >&2
+    mv compose.yaml compose.yaml.failed
+  fi
   exit 1
 }
 
+# compose.yaml.prev — лише від цього запуску: давня копія не має видавати перший деплой за повторний.
+rm -f compose.yaml.prev
 if [ -f compose.yaml ]; then cp compose.yaml compose.yaml.prev; fi
 # Який worker працює зараз і скільки разів він уже перезапускався — щоб smoke рахував лише нові.
 worker_before=$(docker compose ps -q worker 2>/dev/null || true)
@@ -131,6 +176,7 @@ mv compose.yaml.new compose.yaml
 deploy_started=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 docker compose up -d --remove-orphans --no-build --wait --wait-timeout 120 || rollback 'api не став healthy за 120 с'
 smoke || rollback 'функціональна перевірка не пройшла'
+phase=commit
 
 # Новий IMAGE/IMAGE_TAG у .env — атомарно: повна копія (з тими самими правами — там секрети)
 # правиться поруч і лише потім одним mv заміняє .env. Збій запису лишає старий .env цілим, і
