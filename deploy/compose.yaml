@@ -1,35 +1,61 @@
-# Поштомат громади — продакшн на одній VM (docker compose up -d).
-# PostgreSQL працює на самій VM, поза compose.
+# Production on one VM. PostgreSQL is managed outside this Compose project.
 services:
   api:
-    image: poshtomat:latest
-    build:
-      context: ../app
-      dockerfile: ../deploy/Dockerfile
+    image: "${IMAGE_NAME:?Set IMAGE_NAME}:${IMAGE_TAG:?Set IMAGE_TAG}"
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
+    restart: unless-stopped
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 128
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
     environment:
-      TZ: "Europe/Kyiv"
+      TZ: Europe/Kyiv
+      NODE_ENV: production
       PORT: "8080"
-      LOG_LEVEL: "info"
-      DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
-      DB_POOL_MAX: "20"
-      DB_POOL_WAIT_MS: "2000"
-      SMS_BASE_URL: "https://sms.example.net/api/v2"
-      SMS_TOKEN: "CHANGE_ME"
-      SMS_RATE_PER_SEC: "20"
-      COURIER_BASE_URL: "https://courier.example.com/api/v1"
+      LOG_LEVEL: info
+      DATABASE_URL: "${DATABASE_URL:?Set DATABASE_URL}"
+      DB_POOL_MAX: "${DB_POOL_MAX:-20}"
+      DB_POOL_WAIT_MS: "${DB_POOL_WAIT_MS:-2000}"
+      SMS_BASE_URL: "${SMS_BASE_URL:-https://sms.example.net/api/v2}"
+      SMS_TOKEN: "${SMS_TOKEN:?Set SMS_TOKEN}"
+      SMS_RATE_PER_SEC: "${SMS_RATE_PER_SEC:-20}"
+      COURIER_BASE_URL: "${COURIER_BASE_URL:-https://courier.example.com/api/v1}"
 
   worker:
-    image: poshtomat:latest
+    image: "${IMAGE_NAME:?Set IMAGE_NAME}:${IMAGE_TAG:?Set IMAGE_TAG}"
     command: ["node", "src/worker.js"]
+    restart: unless-stopped
+    mem_limit: 256m
+    cpus: 0.5
+    pids_limit: 64
+    init: true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    stop_grace_period: 30s
+    healthcheck:
+      disable: true
     environment:
-      TZ: "Europe/Kyiv"
-      LOG_LEVEL: "info"
-      DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
-      DB_POOL_MAX: "20"
-      DB_POOL_WAIT_MS: "2000"
-      SMS_BASE_URL: "https://sms.example.net/api/v2"
-      SMS_TOKEN: "CHANGE_ME"
-      SMS_RATE_PER_SEC: "20"
-      COURIER_BASE_URL: "https://courier.example.com/api/v1"
+      TZ: Europe/Kyiv
+      NODE_ENV: production
+      LOG_LEVEL: info
+      DATABASE_URL: "${DATABASE_URL:?Set DATABASE_URL}"
+      DB_POOL_MAX: "${DB_POOL_MAX:-20}"
+      DB_POOL_WAIT_MS: "${DB_POOL_WAIT_MS:-2000}"
+      SMS_BASE_URL: "${SMS_BASE_URL:-https://sms.example.net/api/v2}"
+      SMS_TOKEN: "${SMS_TOKEN:?Set SMS_TOKEN}"
+      SMS_RATE_PER_SEC: "${SMS_RATE_PER_SEC:-20}"
+      COURIER_BASE_URL: "${COURIER_BASE_URL:-https://courier.example.com/api/v1}"

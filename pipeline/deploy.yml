@@ -1,0 +1,142 @@
+name: Deploy
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm test
+        working-directory: app
+      - run: npm run test:tools
+      - run: npm run check:deploy
+
+  build:
+    name: Build and publish image
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set image name
+        id: image
+        shell: bash
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/Dockerfile
+          push: true
+          tags: |
+            ${{ steps.image.outputs.image }}:${{ github.sha }}
+            ${{ steps.image.outputs.image }}:latest
+
+  deploy:
+    name: Deploy to production
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: production
+    concurrency:
+      group: production-deploy
+      cancel-in-progress: false
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure SSH
+        shell: bash
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+      - name: Pull and start the approved image
+        shell: bash
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+          IMAGE_NAME: ${{ needs.build.outputs.image }}
+          IMAGE_TAG: ${{ github.sha }}
+          DEPLOY_RUN_NUMBER: ${{ github.run_number }}
+        run: |
+          target="$DEPLOY_USER@$DEPLOY_HOST"
+          candidate="/opt/poshtomat/compose.yaml.$DEPLOY_RUN_NUMBER"
+          scp deploy/compose.yaml "$target:$candidate"
+          remote_script=$(cat <<'REMOTE'
+          trap 'rm -f -- "$COMPOSE_CANDIDATE"' EXIT
+          IFS= read -r ghcr_token || exit 2
+          exec 9>/opt/poshtomat/.deploy.lock
+          flock -x 9 || exit 2
+          last_run=0
+          if [ -f /opt/poshtomat/.last-deploy-run ]; then
+            read -r last_run </opt/poshtomat/.last-deploy-run || exit 2
+          fi
+          case "$DEPLOY_RUN_NUMBER" in ''|*[!0-9]*) exit 2 ;; esac
+          case "$last_run" in ''|*[!0-9]*) exit 2 ;; esac
+          if [ "$DEPLOY_RUN_NUMBER" -lt "$last_run" ]; then
+            echo "Skipping stale deployment run $DEPLOY_RUN_NUMBER; run $last_run was already accepted" >&2
+            exit 0
+          fi
+          printf '%s\n' "$DEPLOY_RUN_NUMBER" > /opt/poshtomat/.last-deploy-run.tmp
+          marker_status=$?
+          if [ "$marker_status" -eq 0 ]; then
+            mv /opt/poshtomat/.last-deploy-run.tmp /opt/poshtomat/.last-deploy-run
+            marker_status=$?
+          fi
+          if [ "$marker_status" -ne 0 ]; then exit "$marker_status"; fi
+          mv "$COMPOSE_CANDIDATE" /opt/poshtomat/compose.yaml || exit 2
+          printf '%s' "$ghcr_token" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          deploy_status=$?
+          if [ "$deploy_status" -eq 0 ]; then
+            docker compose -f /opt/poshtomat/compose.yaml pull
+            deploy_status=$?
+          fi
+          if [ "$deploy_status" -eq 0 ]; then
+            docker compose -f /opt/poshtomat/compose.yaml up -d --remove-orphans --wait --wait-timeout 60
+            deploy_status=$?
+          fi
+          docker logout ghcr.io
+          logout_status=$?
+          if [ "$deploy_status" -ne 0 ]; then
+            exit "$deploy_status"
+          fi
+          if [ "$logout_status" -ne 0 ]; then exit "$logout_status"; fi
+          REMOTE
+          )
+          remote_script_b64=$(printf '%s' "$remote_script" | base64 | tr -d '\n')
+          printf '%s\n' "$GHCR_TOKEN" | ssh "$target" "IMAGE_NAME='$IMAGE_NAME' IMAGE_TAG='$IMAGE_TAG' COMPOSE_CANDIDATE='$candidate' DEPLOY_RUN_NUMBER='$DEPLOY_RUN_NUMBER' GITHUB_ACTOR='$GITHUB_ACTOR' bash -c \"\$(printf '%s' '$remote_script_b64' | base64 -d)\""

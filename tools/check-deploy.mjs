@@ -172,6 +172,7 @@ function readYamlFile(root, rel, parse) {
 
 export function loadContext(root, { parse = parseYaml } = {}) {
   const dockerPath = join(root, PATHS.dockerfile);
+  const configPath = join(root, "app/src/config.js");
   // once npx has failed, do not wait for it again on the next file
   let toolError = null;
   const guarded = (text) => {
@@ -183,6 +184,7 @@ export function loadContext(root, { parse = parseYaml } = {}) {
   return {
     root,
     dockerfile: dockerfileSource(existsSync(dockerPath) ? readFileSync(dockerPath, "utf8") : null),
+    appConfig: existsSync(configPath) ? { exists: true, text: readFileSync(configPath, "utf8") } : { exists: false },
     compose: readYamlFile(root, PATHS.compose, guarded),
     workflow: readYamlFile(root, PATHS.workflow, guarded),
   };
@@ -463,6 +465,45 @@ export const RULES = [
         }
       }
       return problems.length ? fail(problems.join("; ")) : pass("секретоподібних ENV/ARG зі значенням немає");
+    },
+  },
+  {
+    id: "D5",
+    title: "DB pool env у Compose відповідає ключу, який читає застосунок",
+    hint: "У сервісах із DATABASE_URL, env_file або будь-яким DB_POOL_* ключем задайте ключ, який читає app/src/config.js, з додатним лімітом або обов'язковою Compose-підстановкою; checker не може прочитати env_file, тому без явного DB_POOL_MAX перевірка завершується FAIL.",
+    check({ appConfig, compose }) {
+      const problem = composeProblem(compose);
+      if (problem) return problem;
+      if (!appConfig?.exists) return fail("app/src/config.js не знайдено — контракт DB pool env невідомий");
+      const runtimeKeys = [...new Set([...appConfig.text.matchAll(/\benv\.(DB_POOL_[A-Z0-9_]+)\b/g)].map((m) => m[1]))];
+      const keys = runtimeKeys.filter((key) => key.endsWith("_MAX"));
+      if (keys.length !== 1) return fail(`app/src/config.js має однозначно читати один DB_POOL_*_MAX ключ; знайдено: ${keys.join(", ") || "жодного"}`);
+      const expected = keys[0];
+      const problems = [];
+      for (const [name, svc] of services(compose)) {
+        const env = envEntries(svc?.environment);
+        const envKeys = env.map(([key]) => key);
+        const configuredPoolEntries = env.filter(([key]) => /^DB_POOL_[A-Z0-9_]+$/.test(key));
+        const configuredPoolKeys = configuredPoolEntries.map(([key]) => key);
+        const hasDatabaseUrl = envKeys.includes("DATABASE_URL");
+        const usesEnvFile = svc?.env_file !== undefined;
+        const expectedEntry = env.find(([key]) => key === expected);
+        if ((hasDatabaseUrl || configuredPoolEntries.length > 0 || usesEnvFile) && !expectedEntry) {
+          problems.push(`${name}: немає ${expected} (застосунок використовує default)`);
+        }
+        if (expectedEntry) {
+          const value = expectedEntry[1] == null ? "" : String(expectedEntry[1]).trim();
+          const requiredInterpolation = /^\$\{[A-Za-z_][A-Za-z0-9_]*:\?[^}]*\}$/.test(value);
+          const nonEmptyDefault = /^\$\{[A-Za-z_][A-Za-z0-9_]*:-[1-9][0-9]*\}$/.test(value);
+          const positiveInteger = /^[1-9][0-9]*$/.test(value);
+          if (!requiredInterpolation && !nonEmptyDefault && !positiveInteger) {
+            problems.push(`${name}: ${expected} має бути додатним цілим числом або required Compose-підстановкою (інакше застосунок використовує default)`);
+          }
+        }
+        const unsupported = configuredPoolKeys.filter((key) => !runtimeKeys.includes(key));
+        if (unsupported.length) problems.push(`${name}: застосунок не читає ${unsupported.join(", ")}`);
+      }
+      return problems.length ? fail(problems.join("; ")) : pass(`налаштовані сервіси задають непорожній ${expected}`);
     },
   },
   {
