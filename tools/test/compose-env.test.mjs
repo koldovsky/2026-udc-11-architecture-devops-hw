@@ -182,3 +182,17 @@ test("C5 does not count env.NAME inside string literals, but counts ${env.X} and
   const ok = checkTree({ "deploy/compose.yaml": compose, "app/src/config.js": reads });
   assert.equal(ok.status, "PASS", ok.message);
 });
+
+// Writing a variable is not reading it: code that sets process.env.DB_POOL_SIZE (or deletes it)
+// while loadConfig reads only DB_POOL_MAX must still FAIL; a comparison env.X === … is a read.
+test("C5 does not count assignments or delete as reads, but counts comparisons", () => {
+  const writes = CONFIG_JS + 'process.env.DB_POOL_SIZE = "20";\nenv["DB_POOL_SIZE"] = "20";\ndelete process.env.DB_POOL_SIZE;\n';
+  const bad = checkTree({ "deploy/compose.yaml": composeWithPool("DB_POOL_SIZE"), "app/src/config.js": writes });
+  assert.equal(bad.status, "FAIL");
+  assert.match(bad.message, /api: DB_POOL_SIZE; worker: DB_POOL_SIZE$/);
+
+  const compares = CONFIG_JS + 'export const debug = process.env.DEBUG_SQL === "1";\n';
+  const compose = composeWithPool("DB_POOL_MAX").replace("      PORT: \"8080\"", "      PORT: \"8080\"\n      DEBUG_SQL: \"0\"");
+  const ok = checkTree({ "deploy/compose.yaml": compose, "app/src/config.js": compares });
+  assert.equal(ok.status, "PASS", ok.message);
+});

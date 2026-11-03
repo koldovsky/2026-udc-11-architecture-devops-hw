@@ -450,14 +450,23 @@ export function maskJs(src) {
   return out.join("");
 }
 
+// A plain assignment right after env.X / env["X"] (`=`, but not `==`, `===` or `=>`) writes the
+// variable, it does not read it; `delete env.X` removes it. Neither counts as a read.
+const PLAIN_ASSIGNMENT = /^\s*=(?![=>])/;
+const DELETE_BEFORE = /\bdelete\s+(?:[A-Za-z_$][\w$]*\s*\.\s*)*$/;
+
 /** Names one JS source reads from the environment (see maskJs for what does not count). */
 export function envReadsIn(src) {
   const masked = maskJs(src);
   const names = new Set();
-  for (const m of masked.matchAll(ENV_DOT)) names.add(m[1]);
+  const isRead = (start, end) => !PLAIN_ASSIGNMENT.test(masked.slice(end)) && !DELETE_BEFORE.test(masked.slice(0, start));
+  for (const m of masked.matchAll(ENV_DOT)) {
+    if (isRead(m.index, m.index + m[0].length)) names.add(m[1]);
+  }
   for (const m of masked.matchAll(ENV_BRACKET_OPEN)) {
-    const key = src.slice(m.index + m[0].length - 1).match(ENV_BRACKET_KEY);
-    if (key) names.add(key[2]);
+    const keyStart = m.index + m[0].length - 1;
+    const key = src.slice(keyStart).match(ENV_BRACKET_KEY);
+    if (key && isRead(m.index, keyStart + key[0].length)) names.add(key[2]);
   }
   return names;
 }
