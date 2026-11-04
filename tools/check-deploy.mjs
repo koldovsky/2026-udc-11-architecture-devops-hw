@@ -15,7 +15,7 @@
 // tools/test/<name>.test.mjs (npm run test:tools runs only tools/test/*.test.mjs).
 
 import { execSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -623,7 +623,63 @@ export const RULES = [
       return problems.length ? fail(`не закріплено: ${problems.join("; ")}`) : pass(`закріплено: ${count}`);
     },
   },
+  {
+    id: "P1",
+    title: "Кожну змінну оточення з compose і Dockerfile читає код застосунку",
+    hint: "Назва змінної в environment: (compose) або ENV (Dockerfile) має збігатися з env.<NAME> у коді app/ (усі налаштування — у app/src/config.js). Змінну з іншою назвою застосунок мовчки проігнорує і візьме значення за замовчуванням — так 14.10.2026 DB_POOL_SIZE замість DB_POOL_MAX дав пул 4 замість 20. Виправте назву в конфігу деплою або додайте читання в app/src/config.js у тому ж PR.",
+    check({ root, dockerfile, compose }) {
+      const known = appEnvNames(root);
+      if (!known) return skip(`немає ${APP_CODE_DIRS.join(" / ")} — нічого звіряти`);
+      const problem = composeProblem(compose);
+      if (problem) return problem;
+      const problems = [];
+      const check = (where, name) => {
+        if (known.has(name) || RUNTIME_ENV.has(name)) return;
+        const like = similarNames(name, known);
+        problems.push(`${where}: ${name} — код її не читає${like.length ? ` (є ${like.join(", ")})` : ""}`);
+      };
+      for (const [svc, def] of services(compose)) for (const [name] of envEntries(def?.environment)) check(svc, name);
+      for (const ins of dockerfile.instructions) {
+        if (ins.instruction === "ENV") for (const [name] of keyValues("ENV", ins.args)) check(`${PATHS.dockerfile}:${ins.line}`, name);
+      }
+      return problems.length ? fail(problems.join("; ")) : pass(`усі змінні відомі коду (${[...known].length} у app/)`);
+    },
+  },
 ];
+
+// ---------------------------------------------------------------- P1: env names the app reads
+
+const APP_CODE_DIRS = ["app/src", "app/bin"];
+
+// Read by Node or the OS, not by our code: TZ sets the log timestamps (app/src/log.js),
+// NODE_ENV / NODE_OPTIONS / NODE_EXTRA_CA_CERTS are read by Node itself.
+export const RUNTIME_ENV = new Set(["TZ", "NODE_ENV", "NODE_OPTIONS", "NODE_EXTRA_CA_CERTS"]);
+
+const ENV_READ = /\benv\s*(?:\.\s*([A-Za-z_][A-Za-z0-9_]*)|\[\s*["'`]([A-Za-z_][A-Za-z0-9_]*)["'`]\s*\])/g;
+
+/** Every NAME the app reads as env.NAME / process.env.NAME / env["NAME"] (tests excluded); null if there is no app code. */
+export function appEnvNames(root) {
+  const names = new Set();
+  let found = false;
+  const visit = (dir) => {
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) visit(full);
+      else if (/\.[cm]?js$/.test(entry.name)) {
+        found = true;
+        for (const m of readFileSync(full, "utf8").matchAll(ENV_READ)) names.add(m[1] ?? m[2]);
+      }
+    }
+  };
+  for (const rel of APP_CODE_DIRS) if (existsSync(join(root, rel))) visit(join(root, rel));
+  return found ? names : null;
+}
+
+/** Known names that share the first word (DB_POOL_SIZE → DB_POOL_MAX, DB_POOL_WAIT_MS) — a hint, not a verdict. */
+function similarNames(name, known) {
+  const head = name.split("_").slice(0, 2).join("_");
+  return [...known].filter((k) => k !== name && k.split("_").slice(0, 2).join("_") === head).sort();
+}
 
 // ---------------------------------------------------------------- running
 
