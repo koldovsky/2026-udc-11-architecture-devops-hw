@@ -1,0 +1,190 @@
+# Тести → збірка образу → деплой на VM (з ручним погодженням).
+#
+# Щоб GitHub його запускав, файл має лежати в .github/workflows/deploy.yml.
+#
+# Налаштування в GitHub (Settings → Environments → production):
+#   • Required reviewers — хто погоджує деплой; увімкнути «Prevent self-review».
+#   • Deployment branches — лише main.
+#   • Environment secrets (саме в environment, не на рівні репозиторію,
+#     щоб їх бачила лише задача деплою після погодження):
+#       DEPLOY_HOST          адреса VM
+#       DEPLOY_USER          користувач для SSH (у групі docker)
+#       DEPLOY_SSH_KEY       приватний ключ, лише для цього деплою
+#       DEPLOY_KNOWN_HOSTS   рядок(и) `ssh-keyscan <host>`, звірені вручну
+#       DATABASE_URL         postgres://poshtomat:<пароль>@192.0.2.10:5432/poshtomat
+#       SMS_TOKEN            токен SMS-провайдера
+#
+# Рекомендація: закріпіть actions на повних SHA комітів (uses: owner/action@<sha> # vX)
+# і тримайте їх актуальними через Dependabot.
+
+name: deploy
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# За замовчуванням — жодних прав; кожна задача просить лише своє.
+permissions: {}
+
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false   # не обривати деплой посередині
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository_owner }}/poshtomat
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22   # як в образі
+      - run: npm test
+
+  build:
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write   # push у GHCR через GITHUB_TOKEN
+    outputs:
+      image: ${{ env.IMAGE_NAME }}@${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: app
+          file: deploy/Dockerfile
+          push: true
+          pull: true
+          provenance: mode=max
+          sbom: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # Тут задача зупиняється й чекає на погодження Required reviewers.
+    environment:
+      name: production
+    permissions:
+      contents: read
+      packages: read   # короткоживучий токен, щоб VM стягнула образ
+    env:
+      IMAGE: ${{ needs.build.outputs.image }}
+      DEPLOY_DIR: /opt/poshtomat
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+          sparse-checkout: deploy
+
+      - name: Налаштувати SSH
+        env:
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+        run: |
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          # ключ хоста закріплений — без StrictHostKeyChecking=no
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          cat > ~/.ssh/config <<EOF
+          Host vm
+            HostName $DEPLOY_HOST
+            User $DEPLOY_USER
+            IdentityFile ~/.ssh/deploy_key
+            IdentitiesOnly yes
+            StrictHostKeyChecking yes
+            BatchMode yes
+          EOF
+          chmod 600 ~/.ssh/config
+
+      - name: Підготувати .env
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SMS_TOKEN: ${{ secrets.SMS_TOKEN }}
+        run: |
+          set -euo pipefail
+          # значення пишуться в одинарних лапках (compose не інтерполює $ всередині),
+          # тож одинарна лапка чи перенос рядка в секреті зламали б файл — відмовляємо
+          for name in IMAGE DATABASE_URL SMS_TOKEN; do
+            value="${!name}"
+            if [ -z "$value" ]; then echo "::error::$name is empty"; exit 1; fi
+            case "$value" in *"'"*|*$'\n'*) echo "::error::$name contains ' or newline"; exit 1;; esac
+          done
+          umask 077
+          {
+            printf "POSHTOMAT_IMAGE='%s'\n" "$IMAGE"
+            printf "DATABASE_URL='%s'\n" "$DATABASE_URL"
+            printf "SMS_TOKEN='%s'\n" "$SMS_TOKEN"
+          } > "$RUNNER_TEMP/prod.env"
+
+      - name: Передати файли на VM
+        run: |
+          set -euo pipefail
+          ssh vm "install -d -m 750 '$DEPLOY_DIR'"
+          ssh vm "cat > '$DEPLOY_DIR/compose.yaml.new'" < deploy/compose.yaml
+          # секрети йдуть через stdin, не через аргументи команди
+          ssh vm "umask 077 && cat > '$DEPLOY_DIR/.env.new'" < "$RUNNER_TEMP/prod.env"
+
+      - name: Деплой
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GHCR_USER: ${{ github.actor }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$GHCR_TOKEN" | ssh vm "docker login ghcr.io -u '$GHCR_USER' --password-stdin"
+          ssh vm "bash -s" <<EOF
+          set -euo pipefail
+          cd '$DEPLOY_DIR'
+          # попередня версія лишається для ручного відкату (див. нижче)
+          [ -f .env ] && cp -p .env .env.prev
+          [ -f compose.yaml ] && cp -p compose.yaml compose.yaml.prev
+          mv .env.new .env
+          mv compose.yaml.new compose.yaml
+          docker compose config --quiet
+          docker compose pull api worker
+          docker compose up -d --remove-orphans --wait --wait-timeout 90 api worker
+          docker compose ps
+          EOF
+
+      - name: Логи при збої
+        if: failure()
+        run: |
+          ssh vm "cd '$DEPLOY_DIR' && docker compose logs --no-color --tail 100 api worker" || true
+          echo "::warning::Відкат: на VM у $DEPLOY_DIR виконати 'mv .env.prev .env && mv compose.yaml.prev compose.yaml && docker compose up -d --wait'"
+
+      - name: Прибрати облікові дані
+        if: always()
+        run: |
+          ssh vm "docker logout ghcr.io" || true
+          rm -f ~/.ssh/deploy_key "$RUNNER_TEMP/prod.env"
