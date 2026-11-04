@@ -16,7 +16,7 @@ flowchart LR
   delivery(["Служба доставки — сканер<br/>[Person / зовнішній оператор]"])
   staff(["Персонал<br/>[Person, роль staff/admin]"])
   screen["Екран поштомата<br/>[External System]"]
-  monitor(["Черговий / оператор — перевіряє /health вручну<br/>[Person; автоматичного монітора в репо немає]"])
+  monitor(["Черговий / оператор — перевіряє /health вручну<br/>[Person; зовнішнього монітора в репо немає]"])
 
   system["Поштомат громади<br/>[Software System]<br/>реєстрація посилок, SMS з кодом, видача за кодом, повернення через 72 год"]
 
@@ -117,7 +117,7 @@ K* — проти Container кожного прогону. **є** — AI нам�
 | C2 | Мешканець → Екран поштомата: вводить код (6 цифр) | `app/src/parcels.js:58`, `app/src/parcels.js:60` | є (`:43`; але «4-значний» — у коді 6 цифр, `app/src/parcels.js:27`) | є (`:44`) |
 | C3 | Екран поштомата → Поштомат: `POST /pickup` з кодом, HTTP/JSON | `app/src/server.js:42-44`, `app/src/parcels.js:58` | є (`:44`) | є (`:42`) |
 | C4 | Персонал → Поштомат: `GET /admin/parcels`, `Authorization: Bearer <сесія>`, лише staff/admin | `app/src/server.js:47-48`, `app/src/server.js:16-18`, `app/src/parcels.js:73` | є (`:45`) | є (`:43`) |
-| C5 | Черговий / оператор → Поштомат: `GET /health` вручну | ендпоінт — `app/src/server.js:37` (`server.js:75` — виключено з access-логу); хто викликає — `incident/oncall-chat.md:17` (черговий дивиться `/health` під час інциденту), `docs/ops/backup-runbook.md:35` (перевірка після відновлення). Автоматичного монітора, що опитує `/health`, у `deploy/`, `pipeline/`, `materials/` немає | є (`:48`) | пропустив |
+| C5 | Черговий / оператор → Поштомат: `GET /health` вручну | ендпоінт — `app/src/server.js:37` (`server.js:75` — виключено з access-логу); хто викликає — `incident/oncall-chat.md:17` (черговий дивиться `/health` під час інциденту), `docs/ops/backup-runbook.md:35` (перевірка після відновлення). Зовнішньої системи моніторингу, що опитує `/health`, у `deploy/`, `pipeline/`, `materials/` немає. Автоматично `/health` викликає лише Docker `HEALTHCHECK` усередині контейнера api (`deploy/Dockerfile:18-19`, додано в Task D; на `main` його немає — `git show main:deploy/Dockerfile \| grep -c HEALTHCHECK` → `0`): це перевірка самого рушія контейнерів, не зовнішній учасник, тож окремої стрілки на діаграмі для неї немає | є (`:48`) | пропустив |
 | C6 | Поштомат → SMS-провайдер: `POST {SMS_BASE_URL}/messages`, Bearer `SMS_TOKEN` | `app/src/sms.js:31-34`, `app/src/config.js:11-12` | є (`:46`) | є (`:45`) |
 | C7 | SMS-провайдер → Мешканець: SMS «Посилка чекає… Код: …» на `recipientPhone` | `app/src/worker.js:28`, `app/src/worker.js:12` | пропустив (замість неї — `Поштомат → Мешканець` напряму, `:47`, див. «вигадав») | пропустив |
 | C8 | Поштомат → Кур'єрська компанія: `POST {COURIER_BASE_URL}/returns`, причина `not_picked_up_72h` | `app/src/courier.js:7-8`, `app/src/courier.js:14`, `app/bin/expire-parcels.js:15` | пропустив | є (`:46`; ціль — «Служба доставки», злита зі сканером) |

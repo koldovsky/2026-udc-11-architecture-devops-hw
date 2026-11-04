@@ -7,11 +7,11 @@
 #
 # Порядок:
 #   1. перевірити середовище (curl, compose з up --wait-timeout) і compose.yaml.new (config -q,
-#      стягнути образ; у api і worker — https:// для зовнішніх API і DB_POOL_MAX числом) — робочий
+#      стягнути образ; у api і worker — https:// для зовнішніх API і DB_POOL_MAX цілим > 0) — робочий
 #      compose.yaml ще не чіпаємо;
 #   2. зберегти робочий файл як compose.yaml.prev, підмінити, up --wait (api має стати healthy);
 #   3. функціональна перевірка: розмір пулу в api і worker = DB_POOL_MAX, проба через пул api,
-#      worker через 25 с запущений без нових перезапусків, вивів «worker started» і не записав
+#      worker через 25 с запущений без нових перезапусків, вивів «worker started» (якщо перестворений), не записав
 #      «notify round failed»;
 #   4. лише після успіху атомарно записати IMAGE/IMAGE_TAG у .env і рядок у deploys.log.
 # Будь-який збій на кроках 2–3 → повертаємо compose.yaml.prev і образ з .env, вихід ≠ 0; на першому
@@ -60,9 +60,12 @@ want_pool=$(docker compose -f compose.yaml.new config --format json |
         else if (url.protocol !== "https:") problems.push(`${svc}: ${name} — не https://`);
         else if (!url.hostname) problems.push(`${svc}: ${name} — без імені хоста`);
       }
+      // Лише ціле додатне безпечне число: "0" застосунок читає як дефолт 4 (`Number(…) || 4`),
+      // а дуже довге стає Infinity — пул без ліміту. Верхню межу пулу тут не вводимо: її має
+      // погодити команда разом із max_connections PostgreSQL.
       const pool = String(env.DB_POOL_MAX ?? "");
-      if (/^[0-9]+$/.test(pool)) pools.add(Number(pool));
-      else problems.push(`${svc}: DB_POOL_MAX не задано числом`);
+      if (/^[1-9][0-9]*$/.test(pool) && Number.isSafeInteger(Number(pool))) pools.add(Number(pool));
+      else problems.push(`${svc}: DB_POOL_MAX не задано цілим додатним числом`);
     }
     if (pools.size > 1) problems.push(`DB_POOL_MAX різний у сервісах: ${[...pools].join(", ")}`);
     if (problems.length) {
@@ -92,7 +95,8 @@ smoke() {
     [ "$code" = 403 ] || { echo "deploy: проба пулу api — HTTP ${code:-000} замість 403" >&2; return 1; }
   done
   # worker: через 25 с після старту перевіряємо лише три речі — він запущений без нових
-  # перезапусків, у лозі поточного запуску є «worker started», а за час цього деплою немає жодного
+  # перезапусків, у лозі поточного запуску є «worker started» (лише для перествореного
+  # контейнера), а за час цього деплою немає жодного
   # «notify round failed». Що цикл опитування справді пройшов, це не доводить: порожній цикл
   # (немає посилок) нічого в лог не пише.
   # Лог беремо не весь: якщо compose не перестворив worker (той самий образ і конфіг), у ньому
@@ -115,8 +119,13 @@ smoke() {
     { echo 'deploy: не вдалося прочитати лог worker' >&2; return 1; }
   deploy_log=$(docker compose logs --no-log-prefix --since "$deploy_started" worker) ||
     { echo 'deploy: не вдалося прочитати лог worker' >&2; return 1; }
-  grep -q '"worker started"' <<<"$run_log" ||
-    { echo 'deploy: у лозі поточного запуску worker немає «worker started»' >&2; return 1; }
+  # «worker started» вимагаємо лише від нового контейнера. Той самий (не перестворений) уже
+  # перевірено вище — працює і не перезапускався, а його давній стартовий рядок могла витиснути
+  # ротація json-file (20m × 5 у compose).
+  if [ "$id" != "$worker_before" ]; then
+    grep -q '"worker started"' <<<"$run_log" ||
+      { echo 'deploy: у лозі поточного запуску worker немає «worker started»' >&2; return 1; }
+  fi
   if grep -q 'notify round failed' <<<"$deploy_log"; then
     echo 'deploy: worker пише «notify round failed»' >&2
     return 1
