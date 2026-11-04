@@ -1,35 +1,77 @@
 # Поштомат громади — продакшн на одній VM (docker compose up -d).
 # PostgreSQL працює на самій VM, поза compose.
+#
+# Конфіг приходить зі змінних оточення shell (або з .env поруч на сервері — НЕ в git).
+# Обов'язкові змінні (без них compose не стартує — :? нижче):
+#   IMAGE_TAG        — тег образу, напр. sha-<commit>; :latest не деплоїмо
+#   DATABASE_URL     — рядок підключення до PostgreSQL з паролем (секрет)
+#   SMS_TOKEN        — API-токен SMS-шлюзу (секрет)
+#   SMS_BASE_URL     — базовий URL SMS-шлюзу
+#   COURIER_BASE_URL — URL сервісу кур'єрів
+# Необов'язкова:
+#   IMAGE            — шлях до образу, за замовчуванням poshtomat (локальна збірка)
+#
+# Прод:     у /opt/poshtomat; IMAGE і IMAGE_TAG pipeline пише в .env там же → docker compose up -d --no-build
+# Локально (з кореня репо, значення-заглушки):
+#   IMAGE_TAG=local DATABASE_URL=CHANGE_ME SMS_TOKEN=CHANGE_ME \
+#   SMS_BASE_URL=http://localhost:9001 COURIER_BASE_URL=http://localhost:9002 \
+#   docker compose -f deploy/compose.yaml up -d --build
+
+x-env: &env
+  TZ: "Europe/Kyiv"
+  LOG_LEVEL: "info"
+  DB_POOL_MAX: "20"
+  DB_POOL_WAIT_MS: "2000"
+  # Ліміт облікового запису провайдера — 10 SMS/с (materials/vendors/sms-provider.md:16-17);
+  # 5 — запас удвічі, як пропонує ADR-0001, «Що треба зробити» (docs/adr/0001-notifications.md).
+  SMS_RATE_PER_SEC: "5"
+  DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set (PostgreSQL connection string)}
+  SMS_TOKEN: ${SMS_TOKEN:?SMS_TOKEN must be set (SMS gateway API token)}
+  SMS_BASE_URL: ${SMS_BASE_URL:?SMS_BASE_URL must be set}
+  COURIER_BASE_URL: ${COURIER_BASE_URL:?COURIER_BASE_URL must be set}
+
+x-svc: &svc
+  # IMAGE — щоб той самий файл працював і локально (poshtomat, зібраний тут), і на проді
+  # (ghcr.io/<org>/<repo>, куди пушить pipeline/deploy.yml).
+  image: ${IMAGE:-poshtomat}:${IMAGE_TAG:?IMAGE_TAG must be set — never deploy :latest}
+  # Шляхи — відносно цього файлу: context = app/, Dockerfile = deploy/Dockerfile.
+  build:
+    context: ../app
+    dockerfile: ../deploy/Dockerfile
+  restart: unless-stopped
+  # Ротація логів: без неї json-file росте без меж і забиває диск єдиної VM.
+  logging:
+    driver: json-file
+    options:
+      max-size: "20m"
+      max-file: "5"
+  # Ліміти, щоб один сервіс (напр. worker у циклі повторів) не забрав усю VM у PostgreSQL,
+  # який працює на тій самій VM поза compose.
+  deploy:
+    resources:
+      limits:
+        cpus: "1"
+        memory: 256M
+
 services:
   api:
-    image: poshtomat:latest
-    build:
-      context: ../app
-      dockerfile: ../deploy/Dockerfile
+    <<: *svc
     ports:
+      # Поштомати й сканер служби доставки ходять до API мережею (docs/architecture.md), а reverse
+      # proxy з TLS на VM ніде не описаний — тому порт відкритий, як і до Task D. Окреме завдання:
+      # поставити проксі з TLS і тоді звузити до "127.0.0.1:8080:8080".
       - "8080:8080"
     environment:
-      TZ: "Europe/Kyiv"
+      <<: *env
       PORT: "8080"
-      LOG_LEVEL: "info"
-      DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
-      DB_POOL_MAX: "20"
-      DB_POOL_WAIT_MS: "2000"
-      SMS_BASE_URL: "https://sms.example.net/api/v2"
-      SMS_TOKEN: "CHANGE_ME"
-      SMS_RATE_PER_SEC: "20"
-      COURIER_BASE_URL: "https://courier.example.com/api/v1"
+    # healthcheck — з HEALTHCHECK образу (deploy/Dockerfile), тут не дублюємо.
 
   worker:
-    image: poshtomat:latest
+    <<: *svc
     command: ["node", "src/worker.js"]
     environment:
-      TZ: "Europe/Kyiv"
-      LOG_LEVEL: "info"
-      DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
-      DB_POOL_MAX: "20"
-      DB_POOL_WAIT_MS: "2000"
-      SMS_BASE_URL: "https://sms.example.net/api/v2"
-      SMS_TOKEN: "CHANGE_ME"
-      SMS_RATE_PER_SEC: "20"
-      COURIER_BASE_URL: "https://courier.example.com/api/v1"
+      <<: *env
+    # У worker немає HTTP-сервера і портів: HEALTHCHECK з образу (GET :8080/health)
+    # тут завжди падав би і позначав сервіс unhealthy.
+    healthcheck:
+      disable: true

@@ -15,7 +15,7 @@
 // tools/test/<name>.test.mjs (npm run test:tools runs only tools/test/*.test.mjs).
 
 import { execSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
@@ -367,6 +367,134 @@ export function imageProblem(image) {
   return null;
 }
 
+// ---------------------------------------------------------------- app config (C5)
+
+// Where the app reads its config: the code that ships in the image. app/test is left out on
+// purpose: tests set variables (process.env.X = …), which says nothing about what the app reads.
+const APP_SOURCE_DIRS = ["app/src", "app/bin"];
+// Read by the Node runtime itself, not by app code, so env.NAME never shows up for them:
+// TZ — the time zone (libc/ICU), NODE_OPTIONS — flags for the node binary.
+const RUNTIME_ENV = new Set(["TZ", "NODE_OPTIONS"]);
+// Reads in code: env.NAME / process.env.NAME, and env["NAME"]. For the bracket form the name is
+// taken from the source at the opening quote — in the masked text the string itself is blank.
+const ENV_DOT = /\benv\s*\.\s*([A-Za-z_][A-Za-z0-9_]*)/g;
+const ENV_BRACKET_OPEN = /\benv\s*\[\s*["'`]/g;
+const ENV_BRACKET_KEY = /^(["'`])([A-Za-z_][A-Za-z0-9_]*)\1\s*\]/;
+
+function jsFiles(dir) {
+  if (!existsSync(dir)) return [];
+  return readdirSync(dir, { withFileTypes: true }).flatMap((e) => {
+    const full = join(dir, e.name);
+    if (e.isDirectory()) return e.name === "node_modules" ? [] : jsFiles(full);
+    return /\.[cm]?js$/.test(e.name) ? [full] : [];
+  });
+}
+
+/**
+ * The same JS source, same length, with comments and the text of string literals replaced by
+ * spaces (newlines and quote marks kept). So `env.X` mentioned only in a comment or inside a
+ * message string does not count as a read, while code — including ${…} in template literals —
+ * stays as it is. Regex literals are not recognised (app code has none with quotes, // or /*).
+ */
+export function maskJs(src) {
+  const out = src.split("");
+  const n = src.length;
+  const blank = (k) => {
+    if (k < n && out[k] !== "\n") out[k] = " ";
+  };
+  const exprDepth = []; // one entry per open ${ … }: how deep { } nest inside it
+  // Template text from j; returns the index after the closing ` or after "${".
+  const templateText = (j) => {
+    while (j < n) {
+      if (src[j] === "\\") {
+        blank(j++);
+        blank(j++);
+      } else if (src[j] === "`") {
+        return j + 1;
+      } else if (src[j] === "$" && src[j + 1] === "{") {
+        exprDepth.push(0);
+        return j + 2;
+      } else {
+        blank(j++);
+      }
+    }
+    return j;
+  };
+  let i = 0;
+  while (i < n) {
+    const c = src[i];
+    if (c === "/" && src[i + 1] === "/") {
+      while (i < n && src[i] !== "\n") blank(i++);
+    } else if (c === "/" && src[i + 1] === "*") {
+      const end = src.indexOf("*/", i + 2);
+      const stop = end === -1 ? n : end + 2;
+      while (i < stop) blank(i++);
+    } else if (c === "'" || c === '"') {
+      i++;
+      while (i < n && src[i] !== c && src[i] !== "\n") {
+        if (src[i] === "\\") blank(i++);
+        blank(i++);
+      }
+      i++;
+    } else if (c === "`") {
+      i = templateText(i + 1);
+    } else if (c === "}" && exprDepth.length && exprDepth[exprDepth.length - 1] === 0) {
+      exprDepth.pop();
+      i = templateText(i + 1);
+    } else {
+      if (c === "{" && exprDepth.length) exprDepth[exprDepth.length - 1]++;
+      if (c === "}" && exprDepth.length) exprDepth[exprDepth.length - 1]--;
+      i++;
+    }
+  }
+  return out.join("");
+}
+
+// A plain assignment right after env.X / env["X"] (`=`, but not `==`, `===` or `=>`) writes the
+// variable, it does not read it; `delete env.X` removes it. Neither counts as a read.
+const PLAIN_ASSIGNMENT = /^\s*=(?![=>])/;
+const DELETE_BEFORE = /\bdelete\s+(?:[A-Za-z_$][\w$]*\s*\.\s*)*$/;
+
+/** Names one JS source reads from the environment (see maskJs for what does not count). */
+export function envReadsIn(src) {
+  const masked = maskJs(src);
+  const names = new Set();
+  const isRead = (start, end) => !PLAIN_ASSIGNMENT.test(masked.slice(end)) && !DELETE_BEFORE.test(masked.slice(0, start));
+  for (const m of masked.matchAll(ENV_DOT)) {
+    if (isRead(m.index, m.index + m[0].length)) names.add(m[1]);
+  }
+  for (const m of masked.matchAll(ENV_BRACKET_OPEN)) {
+    const keyStart = m.index + m[0].length - 1;
+    const key = src.slice(keyStart).match(ENV_BRACKET_KEY);
+    if (key && isRead(m.index, keyStart + key[0].length)) names.add(key[2]);
+  }
+  return names;
+}
+
+/** Names the app reads from the environment, or null when there is no app source at all. */
+function appEnvReads(root) {
+  const files = APP_SOURCE_DIRS.flatMap((d) => jsFiles(join(root, d)));
+  if (!files.length) return null;
+  const names = new Set();
+  for (const file of files) {
+    for (const name of envReadsIn(readFileSync(file, "utf8"))) names.add(name);
+  }
+  return names;
+}
+
+/**
+ * The app's services: those with build: and those running the same image as one of them.
+ * Anything else (postgres, nginx, …) reads its own variables, not ours. With no build: at all
+ * there is nothing to tell them apart by, so every service counts — a loud FAIL beats a silent PASS.
+ */
+function splitAppServices(all) {
+  const built = all.filter(([, svc]) => svc?.build);
+  if (!built.length) return { appServices: all, thirdPartyServices: [] };
+  const images = new Set(built.map(([, svc]) => svc?.image).filter(Boolean));
+  const isApp = ([, svc]) => Boolean(svc?.build) || images.has(svc?.image);
+  return { appServices: all.filter(isApp), thirdPartyServices: all.filter((s) => !isApp(s)) };
+}
+
 const isNoneTest = (t) => (Array.isArray(t) ? String(t[0]).toUpperCase() === "NONE" : typeof t === "string" && t.trim().toUpperCase() === "NONE");
 const healthcheckOff = (hc) => hc?.disable === true || isNoneTest(hc?.test);
 
@@ -530,6 +658,28 @@ export const RULES = [
         }
       }
       return problems.length ? fail(problems.join("; ")) : pass("секретоподібні змінні задано посиланнями");
+    },
+  },
+  {
+    id: "C5",
+    title: "Кожну змінну оточення з compose застосунок справді читає",
+    hint: `Назва змінної в environment: має збігатися з тією, яку читає код (env.NAME в app/src або app/bin) — інакше значення мовчки ігнорується і працює дефолт. Змінні рантайму Node (${[...RUNTIME_ENV].join(", ")}) і сервіси зі стороннім образом не перевіряються.`,
+    check({ compose, root }) {
+      const problem = composeProblem(compose);
+      if (problem) return problem;
+      const reads = appEnvReads(root);
+      if (!reads) return skip(`немає коду застосунку в ${APP_SOURCE_DIRS.join(", ")} — нема з чим звіряти`);
+      const { appServices, thirdPartyServices } = splitAppServices(services(compose));
+      const problems = [];
+      const keys = appServices.flatMap(([name, svc]) => envEntries(svc?.environment).map(([key]) => [name, key]));
+      for (const [name, key] of keys) {
+        if (!reads.has(key) && !RUNTIME_ENV.has(key)) problems.push(`${name}: ${key}`);
+      }
+      if (problems.length) return fail(`застосунок не читає (значення мовчки ігнорується): ${problems.join("; ")}`);
+      const unique = new Set(keys.map(([, key]) => key)).size;
+      const serviceNames = (entries) => entries.map(([name]) => name).join(", ");
+      const skippedNote = thirdPartyServices.length ? `; сторонні образи не перевірялись: ${serviceNames(thirdPartyServices)}` : "";
+      return pass(`записів environment: ${keys.length} у сервісах ${serviceNames(appServices)} (унікальних назв: ${unique})${skippedNote}`);
     },
   },
   {
