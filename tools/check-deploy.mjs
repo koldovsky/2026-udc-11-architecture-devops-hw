@@ -370,6 +370,43 @@ export function imageProblem(image) {
 const isNoneTest = (t) => (Array.isArray(t) ? String(t[0]).toUpperCase() === "NONE" : typeof t === "string" && t.trim().toUpperCase() === "NONE");
 const healthcheckOff = (hc) => hc?.disable === true || isNoneTest(hc?.test);
 
+/** Повернути текст JS-файлу, прибравши рядкові/шаблонні літерали і коментарі — залишається лише виконуваний код. */
+function jsCodeOnly(text) {
+  let out = "";
+  let i = 0;
+  while (i < text.length) {
+    const ch = text[i];
+    const nxt = text[i + 1];
+    // рядковий або шаблонний літерал: замінити увесь литерал (включаючи лапки) на пробіл
+    if (ch === '"' || ch === "'" || ch === "`") {
+      const quote = ch;
+      i++;
+      while (i < text.length && text[i] !== quote) {
+        if (text[i] === "\\" && i + 1 < text.length) { i += 2; continue; } // ескейп-послідовність
+        i++;
+      }
+      if (i < text.length) i++; // закриваюча лапка
+      out += " ";
+      continue;
+    }
+    // коментар до кінця рядка
+    if (ch === "/" && nxt === "/") {
+      while (i < text.length && text[i] !== "\n") i++;
+      continue;
+    }
+    // блоковий коментар /* ... */
+    if (ch === "/" && nxt === "*") {
+      i += 2;
+      while (i < text.length && !(text[i] === "*" && text[i + 1] === "/")) i++;
+      if (i < text.length) i += 2;
+      continue;
+    }
+    out += ch;
+    i++;
+  }
+  return out;
+}
+
 // ---------------------------------------------------------------- rules
 
 // A one-shot job (e.g. a nightly script run by `docker compose run`): no ports and an explicit
@@ -530,6 +567,80 @@ export const RULES = [
         }
       }
       return problems.length ? fail(problems.join("; ")) : pass("секретоподібні змінні задано посиланнями");
+    },
+  },
+  {
+    id: "C5",
+    title: "Контракт compose ↔ config для пулу БД (DB_POOL_*)",
+    hint: "Кожен довгоживучий сервіс має DB_POOL_MAX у environment; кожен DB_POOL_* у compose має бути змінною, яку читає app/src/config.js (DB_POOL_MAX, DB_POOL_WAIT_MS). Разові job без ports: і з restart: \"no\" виключені.",
+    check({ compose, root }) {
+      const problem = composeProblem(compose);
+      if (problem) return problem;
+
+      // Підтримувані DB_POOL_* зчитуємо з config.js (loadConfig), а не тримаємо жорстко закодованим списком.
+      const configPath = join(root, "app", "src", "config.js");
+      const knownPoolVars = new Set();
+      let configMissing = false;
+      if (!existsSync(configPath)) {
+        configMissing = true;
+      } else {
+        const configText = readFileSync(configPath, "utf8");
+        const code = jsCodeOnly(configText);
+        // env.DB_POOL_MAX / env?.DB_POOL_MAX — ідентифікатори переживають прибирання рядків і коментарів.
+        for (const m of code.matchAll(/env\??\.(DB_POOL_\w+)/g)) knownPoolVars.add(m[1]);
+        // env['DB_POOL_MAX'] / env["DB_POOL_MAX"] — ім'я змінної всередині рядкового літерала,
+        // який jsCodeOnly видаляє, тому шукаємо у сирому тексті без коментарів (щоб не потрапило з коментаря).
+        const textWithoutComments = configText
+          .replace(/\/\/[^\n]*/g, "")
+          .replace(/\/\*[\s\S]*?\*\//g, "");
+        for (const m of textWithoutComments.matchAll(/env\[['"](DB_POOL_\w+)['"]\]/g)) knownPoolVars.add(m[1]);
+        // { DB_POOL_MAX } = env — деструктуризація з env.
+        for (const m of code.matchAll(/\{\s*([^}]*?)\s*\}\s*=\s*env/g)) {
+          for (const vm of m[1].matchAll(/DB_POOL_\w+/g)) knownPoolVars.add(vm[0]);
+        }
+        // const e = env; e.DB_POOL_MAX — читання через псевдонім env.
+        for (const m of code.matchAll(/(?:const|let|var)\s+([A-Za-z_]\w*)\s*=\s*env\b/g)) {
+          const alias = m[1];
+          for (const mm of code.matchAll(new RegExp(`\\b${alias}\\.(DB_POOL_\\w+)`, "g"))) knownPoolVars.add(mm[1]);
+        }
+      }
+
+      const problems = [];
+      const allPoolVarNames = new Set(); // усі DB_POOL_*, що зустрічаються у довгоживучих сервісах
+
+      for (const [name, svc] of services(compose)) {
+        if (oneShot(svc)) continue;
+        const entries = envEntries(svc?.environment);
+        const poolVars = entries.filter(([k]) => /^DB_POOL_/.test(k));
+        const poolVarNames = new Set(poolVars.map(([k]) => k));
+        for (const k of poolVarNames) allPoolVarNames.add(k);
+
+        if (!poolVarNames.has("DB_POOL_MAX")) {
+          problems.push(`${name}: немає DB_POOL_MAX у environment`);
+        }
+        // Композ → конфіг: немає застарілих змінних пулу.
+        for (const [k] of poolVars) {
+          if (!knownPoolVars.has(k)) {
+            problems.push(`${name}: невідома змінна пулу ${k} (config.js читає лише ${[...knownPoolVars].sort().join(", ") || "(config.js відсутній)"})`);
+          }
+        }
+      }
+
+      // Конфіг → композ: DB_POOL_MAX обов'язкова у кожному довгоживучому сервісі (перевіряється вище).
+      // Інші DB_POOL_* (наприклад DB_POOL_WAIT_MS) можуть бути відсутні — застосунок використовує значення за замовчуванням.
+      const optionalPoolVars = new Set(["DB_POOL_WAIT_MS"]);
+      for (const k of [...knownPoolVars].sort()) {
+        if (k === "DB_POOL_MAX" || optionalPoolVars.has(k)) continue;
+        if (!allPoolVarNames.has(k)) {
+          problems.push(`підтримувана змінна пулу ${k} відсутня у compose (config.js читає env.${k})`);
+        }
+      }
+
+      if (configMissing) {
+        problems.push(`app/src/config.js відсутній — неможливо перевірити контракт compose ↔ config для пулу БД`);
+      }
+
+      return problems.length ? fail(problems.join("; ")) : pass("контракт compose ↔ config для пулу БД соблюдено");
     },
   },
   {

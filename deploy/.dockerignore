@@ -1,0 +1,13 @@
+.git
+.gitignore
+node_modules
+npm-debug.log*
+Dockerfile
+.dockerignore
+*.md
+test/
+__pycache__/
+.env
+.env.*
+*.local
+coverage/

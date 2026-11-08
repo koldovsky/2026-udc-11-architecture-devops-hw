@@ -1,0 +1,145 @@
+name: Deploy to production
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Мінімальні права: читання репозиторія та push пакетів до GHCR.
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  test:
+    name: Run test suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Run tests
+        run: npm test
+        working-directory: app
+
+  build:
+    name: Build and publish container image
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ steps.extract-tag.outputs.image_tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/poshtomat
+          tags: |
+            type=sha,prefix=sha-
+            type=ref,event=branch
+
+      # Тег sha-<commit> — незмінна ідентичність образу, зібраного саме цим запуском.
+      # Загальний тег main (type=ref,event=branch) mutable: паралельний запуск може
+      # перештовхнути main, і деплой підхопить чужий образ. Використовуємо лише sha-тег.
+      - name: Extract immutable image tag
+        id: extract-tag
+        run: |
+          TAG=$(printf '%s\n' "${{ steps.meta.outputs.tags }}" \
+            | grep -E ':sha-[0-9a-f]+$' | head -n 1 | sed 's/.*://')
+          echo "image_tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: app
+          file: deploy/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy to production
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://poshtomat.example.com
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Deploy via SSH
+        env:
+          COMPOSE_ENV: |
+            GHCR_OWNER=${{ github.repository_owner }}
+            TAG=${{ needs.build.outputs.image_tag }}
+            DATABASE_URL=${{ secrets.DATABASE_URL }}
+            SMS_BASE_URL=${{ secrets.SMS_BASE_URL }}
+            SMS_TOKEN=${{ secrets.SMS_TOKEN }}
+            SMS_RATE_PER_SEC=${{ secrets.SMS_RATE_PER_SEC }}
+            COURIER_BASE_URL=${{ secrets.COURIER_BASE_URL }}
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s' "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          # ssh-keyscan друкує записи у форматі «<хост> <тип-ключа> <base64-ключ>».
+          # PROD_HOST_KEY — довірений base64-ключ (третє поле запису), без завершальних переносів.
+          SCANNED_RECORD=$(ssh-keyscan "${{ secrets.PROD_HOST }}" 2>/dev/null \
+            | awk -v h="${{ secrets.PROD_HOST }}" '$1 == h { print; exit }')
+          SCANNED_KEY=$(printf '%s' "$SCANNED_RECORD" | awk '{ print $3 }')
+          # нормалізувати завершальні білі символи / переноси рядка з обох сторін
+          SCANNED_KEY="${SCANNED_KEY%"${SCANNED_KEY##*[![:space:]]}"}"
+          TRUSTED_KEY="${{ secrets.PROD_HOST_KEY }}"
+          TRUSTED_KEY="${TRUSTED_KEY%"${TRUSTED_KEY##*[![:space:]]}"}"
+          if [ -z "$SCANNED_KEY" ] || [ "$SCANNED_KEY" != "$TRUSTED_KEY" ]; then
+            echo "ERROR: SSH host key for ${{ secrets.PROD_HOST }} does not match trusted key — aborting" >&2
+            exit 1
+          fi
+          # додати до known_hosts лише після успішної перевірки
+          printf '%s\n' "$SCANNED_RECORD" >> ~/.ssh/known_hosts
+
+          umask 077
+          printf '%s\n' "$COMPOSE_ENV" > /tmp/compose.env
+          chmod 600 /tmp/compose.env
+          # створити каталог призначення на віддаленому хості тими ж обліковими даними
+          ssh "${{ secrets.SSH_USER }}@${{ secrets.PROD_HOST }}" 'mkdir -p ~/poshtomat/deploy/'
+          scp -r deploy/. "${{ secrets.SSH_USER }}@${{ secrets.PROD_HOST }}:~/poshtomat/deploy/"
+          scp /tmp/compose.env "${{ secrets.SSH_USER }}@${{ secrets.PROD_HOST }}:~/poshtomat/deploy/.env"
+
+          ssh "${{ secrets.SSH_USER }}@${{ secrets.PROD_HOST }}" '
+            set -e
+            umask 077
+            cd ~/poshtomat
+            chmod 600 deploy/.env
+            docker compose -f deploy/compose.yaml --env-file deploy/.env pull
+            docker compose -f deploy/compose.yaml --env-file deploy/.env up -d
+            for i in $(seq 1 30); do
+              if curl -fsS http://127.0.0.1:8080/health >/dev/null 2>&1; then
+                echo "deployment healthy"
+                exit 0
+              fi
+              sleep 2
+            done
+            echo "health check failed" >&2
+            exit 1
+          '

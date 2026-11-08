@@ -1,35 +1,67 @@
 # Поштомат громади — продакшн на одній VM (docker compose up -d).
 # PostgreSQL працює на самій VM, поза compose.
+# Змінні оточення беруться з deploy/.env — скопіюйте deploy/.env.example у deploy/.env
+# і поставте реальні значення. Ніколи не комітьте .env із секретами.
+
 services:
   api:
-    image: poshtomat:latest
+    image: ghcr.io/${GHCR_OWNER:-poshtomat}/poshtomat:${TAG:?IMAGE_TAG must be set}
     build:
       context: ../app
       dockerfile: ../deploy/Dockerfile
+    restart: unless-stopped
+    # Слухаємо лише localhost — перед сервісом має бути reverse proxy (nginx/Traefik).
     ports:
-      - "8080:8080"
+      - "127.0.0.1:8080:8080"
     environment:
       TZ: "Europe/Kyiv"
       PORT: "8080"
       LOG_LEVEL: "info"
-      DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
+      DATABASE_URL: ${DATABASE_URL}
       DB_POOL_MAX: "20"
       DB_POOL_WAIT_MS: "2000"
-      SMS_BASE_URL: "https://sms.example.net/api/v2"
-      SMS_TOKEN: "CHANGE_ME"
-      SMS_RATE_PER_SEC: "20"
-      COURIER_BASE_URL: "https://courier.example.com/api/v1"
+      SMS_BASE_URL: ${SMS_BASE_URL}
+      SMS_TOKEN: ${SMS_TOKEN}
+      SMS_RATE_PER_SEC: ${SMS_RATE_PER_SEC:-20}
+      COURIER_BASE_URL: ${COURIER_BASE_URL}
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
 
   worker:
-    image: poshtomat:latest
+    image: ghcr.io/${GHCR_OWNER:-poshtomat}/poshtomat:${TAG:?IMAGE_TAG must be set}
+    build:
+      context: ../app
+      dockerfile: ../deploy/Dockerfile
     command: ["node", "src/worker.js"]
+    restart: unless-stopped
+    # Worker не запускає HTTP-сервер — перевіряємо, що процес працює
+    healthcheck:
+      test: ["CMD-SHELL", "ps | grep -q '[w]orker.js' || exit 1"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
     environment:
       TZ: "Europe/Kyiv"
       LOG_LEVEL: "info"
-      DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
+      DATABASE_URL: ${DATABASE_URL}
       DB_POOL_MAX: "20"
       DB_POOL_WAIT_MS: "2000"
-      SMS_BASE_URL: "https://sms.example.net/api/v2"
-      SMS_TOKEN: "CHANGE_ME"
-      SMS_RATE_PER_SEC: "20"
-      COURIER_BASE_URL: "https://courier.example.com/api/v1"
+      SMS_BASE_URL: ${SMS_BASE_URL}
+      SMS_TOKEN: ${SMS_TOKEN}
+      SMS_RATE_PER_SEC: ${SMS_RATE_PER_SEC:-20}
+      COURIER_BASE_URL: ${COURIER_BASE_URL}
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
