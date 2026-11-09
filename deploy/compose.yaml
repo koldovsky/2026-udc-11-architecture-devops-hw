@@ -1,35 +1,46 @@
-# Поштомат громади — продакшн на одній VM (docker compose up -d).
-# PostgreSQL працює на самій VM, поза compose.
+# PostgreSQL is managed outside Compose. IMAGE must identify a tested release.
+x-runtime: &runtime
+  image: ${IMAGE:?Set IMAGE to the release image}
+  user: "1000:1000"
+  init: true
+  restart: unless-stopped
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=16m,mode=1777
+  pids_limit: 128
+  mem_limit: 512m
+  cpus: 1.0
+  stop_grace_period: 30s
+  logging:
+    driver: json-file
+    options:
+      max-size: "10m"
+      max-file: "3"
+  environment:
+    NODE_ENV: production
+    TZ: Europe/Kyiv
+    PORT: "8080"
+    LOG_LEVEL: info
+    DATABASE_URL: ${DATABASE_URL:?Set DATABASE_URL}
+    DB_POOL_MAX: "20"
+    DB_POOL_WAIT_MS: "2000"
+    SMS_BASE_URL: ${SMS_BASE_URL:?Set SMS_BASE_URL}
+    SMS_TOKEN: ${SMS_TOKEN:?Set SMS_TOKEN}
+    SMS_RATE_PER_SEC: "20"
+    COURIER_BASE_URL: ${COURIER_BASE_URL:?Set COURIER_BASE_URL}
+
 services:
   api:
-    image: poshtomat:latest
-    build:
-      context: ../app
-      dockerfile: ../deploy/Dockerfile
+    <<: *runtime
+    # TLS reverse proxy on the VM forwards to this loopback-only port.
     ports:
-      - "8080:8080"
-    environment:
-      TZ: "Europe/Kyiv"
-      PORT: "8080"
-      LOG_LEVEL: "info"
-      DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
-      DB_POOL_MAX: "20"
-      DB_POOL_WAIT_MS: "2000"
-      SMS_BASE_URL: "https://sms.example.net/api/v2"
-      SMS_TOKEN: "CHANGE_ME"
-      SMS_RATE_PER_SEC: "20"
-      COURIER_BASE_URL: "https://courier.example.com/api/v1"
+      - "127.0.0.1:8080:8080"
 
   worker:
-    image: poshtomat:latest
+    <<: *runtime
     command: ["node", "src/worker.js"]
-    environment:
-      TZ: "Europe/Kyiv"
-      LOG_LEVEL: "info"
-      DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
-      DB_POOL_MAX: "20"
-      DB_POOL_WAIT_MS: "2000"
-      SMS_BASE_URL: "https://sms.example.net/api/v2"
-      SMS_TOKEN: "CHANGE_ME"
-      SMS_RATE_PER_SEC: "20"
-      COURIER_BASE_URL: "https://courier.example.com/api/v1"
+    # The image's HTTP healthcheck applies only to the API.
+    healthcheck:
+      disable: true

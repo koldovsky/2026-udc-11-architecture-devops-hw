@@ -1,0 +1,141 @@
+name: Test, build and deploy
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: '24'
+      - run: npm test
+        working-directory: app
+      - run: npm run test:tools
+      - run: npm run check:deploy
+
+  build:
+    needs: test
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - name: Build and smoke test the release
+        env:
+          IMAGE: poshtomat:${{ github.sha }}
+        run: |
+          set -euo pipefail
+          docker build --pull -f deploy/Dockerfile -t "$IMAGE" app
+          trap 'docker rm -f smoke >/dev/null 2>&1 || true' EXIT
+          docker run -d --name smoke --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --user 1000:1000 "$IMAGE"
+          for attempt in $(seq 1 30); do
+            status=$(docker inspect --format '{{.State.Health.Status}}' smoke)
+            if [ "$status" = healthy ]; then break; fi
+            sleep 2
+          done
+          test "$status" = healthy
+          docker save "$IMAGE" | gzip > image.tar.gz
+          sha256sum image.tar.gz > image.tar.gz.sha256
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: release-${{ github.sha }}
+          path: |
+            image.tar.gz
+            image.tar.gz.sha256
+            deploy/compose.yaml
+          retention-days: 3
+          if-no-files-found: error
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # Configure Required reviewers and main-only deployment in repository settings.
+    environment: production
+    concurrency:
+      group: production
+      cancel-in-progress: false
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: release-${{ github.sha }}
+          path: release
+      - name: Deploy the tested image over verified SSH
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SMS_TOKEN: ${{ secrets.SMS_TOKEN }}
+          SMS_BASE_URL: ${{ secrets.SMS_BASE_URL }}
+          COURIER_BASE_URL: ${{ secrets.COURIER_BASE_URL }}
+          IMAGE: poshtomat:${{ github.sha }}
+        run: |
+          set -euo pipefail
+          umask 077
+          ssh_dir=$(mktemp -d)
+          remote_dir=''
+          cleanup() {
+            if [ -n "$remote_dir" ]; then
+              ssh -F "$ssh_dir/config" production "rm -rf -- '$remote_dir'" || true
+            fi
+            rm -rf "$ssh_dir"
+          }
+          trap cleanup EXIT
+          export SSH_DIR="$ssh_dir"
+          python3 <<'PY'
+          import os, pathlib, re, shlex
+          env = os.environ
+          for name in ('DEPLOY_HOST', 'DEPLOY_USER', 'DEPLOY_SSH_KEY',
+                       'DEPLOY_KNOWN_HOSTS', 'DATABASE_URL', 'SMS_TOKEN',
+                       'SMS_BASE_URL', 'COURIER_BASE_URL'):
+              if not env.get(name):
+                  raise SystemExit(f'Missing secret: {name}')
+          if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9.-]*', env['DEPLOY_HOST']):
+              raise SystemExit('Invalid DEPLOY_HOST')
+          if not re.fullmatch(r'[a-z_][a-z0-9_-]*', env['DEPLOY_USER']):
+              raise SystemExit('Invalid DEPLOY_USER')
+          root = pathlib.Path(env['SSH_DIR'])
+          (root / 'key').write_text(env['DEPLOY_SSH_KEY'] + '\n')
+          (root / 'known_hosts').write_text(env['DEPLOY_KNOWN_HOSTS'] + '\n')
+          (root / 'config').write_text(
+              f"Host production\n  HostName {env['DEPLOY_HOST']}\n"
+              f"  User {env['DEPLOY_USER']}\n  IdentityFile {root}/key\n"
+              f"  UserKnownHostsFile {root}/known_hosts\n"
+              "  StrictHostKeyChecking yes\n  BatchMode yes\n"
+              "  IdentitiesOnly yes\n  ConnectTimeout 15\n")
+          script = '#!/bin/bash\nset -euo pipefail\ncd -- "$(dirname -- "$0")"\n'
+          for name in ('IMAGE', 'DATABASE_URL', 'SMS_TOKEN', 'SMS_BASE_URL', 'COURIER_BASE_URL'):
+              script += f'export {name}={shlex.quote(env[name])}\n'
+          script += '''sha256sum -c image.tar.gz.sha256
+          docker load < image.tar.gz
+          docker compose -p poshtomat -f deploy/compose.yaml config --quiet
+          docker compose -p poshtomat -f deploy/compose.yaml up -d --no-build --pull never --remove-orphans --wait --wait-timeout 120
+          '''
+          (root / 'deploy.sh').write_text(script)
+          PY
+          remote_dir=$(ssh -F "$ssh_dir/config" production 'umask 077; mktemp -d /tmp/poshtomat.XXXXXXXXXX')
+          [[ "$remote_dir" =~ ^/tmp/poshtomat\.[A-Za-z0-9]+$ ]]
+          scp -F "$ssh_dir/config" -r release/. "production:$remote_dir/"
+          scp -F "$ssh_dir/config" "$ssh_dir/deploy.sh" "production:$remote_dir/deploy.sh"
+          ssh -F "$ssh_dir/config" production "bash '$remote_dir/deploy.sh'"

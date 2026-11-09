@@ -238,6 +238,23 @@ test("W5: every uses: is pinned to a version tag or a full SHA", () => {
   assert.equal(status("W5", ctx({ workflow: wf({ jobs: { reuse: { uses: "example/workflows/.github/workflows/ship.yml@master" } } }) })), "FAIL");
 });
 
+test("I1: the incident's DB_POOL_SIZE rename fails, valid environment forms pass", () => {
+  const incident = { services: {
+    api: svc({ environment: { DATABASE_URL: "postgres://db", DB_POOL_SIZE: "20" } }),
+    worker: svc({ environment: { DATABASE_URL: "postgres://db", DB_POOL_SIZE: "20" } }),
+  } };
+  assert.equal(status("I1", ctx({ compose: incident })), "FAIL");
+
+  const valid = { services: {
+    api: svc({ environment: ["DATABASE_URL=postgres://db", "DB_POOL_MAX=20"] }),
+    worker: svc({ environment: { DATABASE_URL: "postgres://db", DB_POOL_MAX: "${DB_POOL_MAX:?required}" } }),
+    metrics: svc(), // unrelated services do not need a DB pool setting
+  } };
+  assert.equal(status("I1", ctx({ compose: valid })), "PASS");
+  assert.equal(status("I1", ctx({ compose: { services: { ...valid.services, worker: svc({ environment: ["DB_POOL_MAX"] }) } } })), "FAIL");
+  assert.equal(status("I1", ctx({ compose: { services: { ...valid.services, worker: svc({ environment: { DB_POOL_MAX: "${DB_POOL_MAX}" } }) } } })), "FAIL");
+});
+
 test("secret-like names", () => {
   const positives = ["SMS_TOKEN", "DB_PASSWORD", "API_KEY", "client-secret", "APIKEY", "GITHUB_TOKEN", "PGPASSWORD", "DBPASSWORD", "key", "ssh-key", "passphrase"];
   for (const name of positives) assert.ok(isSecretLike(name), name);

@@ -623,6 +623,32 @@ export const RULES = [
       return problems.length ? fail(`не закріплено: ${problems.join("; ")}`) : pass(`закріплено: ${count}`);
     },
   },
+  {
+    id: "I1",
+    title: "Контракт розміру пулу БД для API і worker",
+    hint: "Задайте DB_POOL_MAX в environment: обох сервісів (додатне число або обов'язкове ${DB_POOL_MAX:?…}). Код читає саме DB_POOL_MAX; DB_POOL_SIZE його не замінює.",
+    check({ compose }) {
+      const problem = composeProblem(compose);
+      if (problem) return problem;
+      const byName = Object.fromEntries(services(compose));
+      const problems = [];
+      for (const name of ["api", "worker"]) {
+        if (!byName[name]) {
+          problems.push(`${name}: сервіс відсутній`);
+          continue;
+        }
+        const value = new Map(envEntries(byName[name].environment)).get("DB_POOL_MAX");
+        const setting = String(value ?? "").trim();
+        const positiveNumber = /^[1-9]\d*$/.test(setting);
+        const requiredReference = /^\$\{[A-Za-z_][A-Za-z0-9_]*:\?[^}]*\}$/.test(setting);
+        const positiveDefault = /^\$\{[A-Za-z_][A-Za-z0-9_]*:-[1-9]\d*\}$/.test(setting);
+        if (!positiveNumber && !requiredReference && !positiveDefault) {
+          problems.push(`${name}: DB_POOL_MAX не задано надійним значенням`);
+        }
+      }
+      return problems.length ? fail(problems.join("; ")) : pass("api і worker задають DB_POOL_MAX");
+    },
+  },
 ];
 
 // ---------------------------------------------------------------- running
