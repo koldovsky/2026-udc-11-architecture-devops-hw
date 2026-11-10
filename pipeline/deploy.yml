@@ -1,0 +1,343 @@
+# Community Parcel Locker: tests → image build → production deploy (with manual approval).
+#
+# In the repository, this file lives at .github/workflows/deploy.yml.
+#
+# One-time setup (Settings → Environments → production):
+#   - Required reviewers: who approves the deploy; ideally also "Prevent self-review".
+#   - Deployment branches: "Selected branches" → main only.
+#   - Environment secrets (repository-level secrets are visible to every job; these only to the approved one):
+#       DEPLOY_HOST          VM address
+#       DEPLOY_USER          deploy user on the VM (in the docker group, owns /opt/poshtomat)
+#       DEPLOY_SSH_KEY       private key (ed25519) of that user, without a passphrase, used only for deploys
+#       DEPLOY_KNOWN_HOSTS   output of `ssh-keyscan -t ed25519 <host>`, verified out of band
+#       DATABASE_URL         postgres://poshtomat:<password>@192.0.2.10:5432/poshtomat
+#       SMS_TOKEN            SMS provider token
+#
+# The image is pushed to GHCR using the job's GITHUB_TOKEN; on the VM it is pulled with the same
+# short-lived token (it expires when the job ends), so no long-lived registry token is stored on the VM.
+
+name: deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "app/**"
+      - "deploy/**"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+
+# Default is no permissions at all; each job asks for exactly what it needs.
+permissions: {}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Tests run in exactly the same base image as production (FROM is taken from the
+      # Dockerfile), without network access and not as root.
+      - name: Unit tests (in the production base image)
+        run: |
+          base="$(awk '/^FROM /{print $2; exit}' deploy/Dockerfile)"
+          echo "Base image: $base"
+          docker run --rm --network none --user node \
+            -v "$PWD/app:/app:ro" -w /app \
+            "$base" npm test
+
+      - name: Validate compose.yaml
+        env:
+          POSHTOMAT_IMAGE: example.invalid/poshtomat@sha256:0000000000000000000000000000000000000000000000000000000000000000
+          DATABASE_URL: postgres://ci@localhost/ci
+          SMS_TOKEN: ci-placeholder
+        run: |
+          docker compose -f deploy/compose.yaml config --quiet
+          docker compose -f deploy/compose.yaml --profile jobs config --quiet
+
+  build:
+    name: Build image
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write # push to ghcr.io
+    outputs:
+      image: ${{ steps.ref.outputs.image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Image name
+        id: name
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}/poshtomat" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      # Build locally first and check it, push only after that.
+      - name: Build (local)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: app
+          file: deploy/Dockerfile
+          load: true
+          push: false
+          provenance: false
+          tags: poshtomat:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test of the image
+        run: |
+          set -euo pipefail
+          test "$(docker run --rm --entrypoint id poshtomat:ci -u)" != "0" \
+            || { echo "::error::container runs as root"; exit 1; }
+          if docker run --rm --entrypoint sh poshtomat:ci -c 'test -w /app/src'; then
+            echo "::error::code in /app is writable by the process"; exit 1
+          fi
+
+          cid="$(docker run -d --read-only --tmpfs /tmp --cap-drop ALL \
+                  --security-opt no-new-privileges -p 127.0.0.1:18080:8080 poshtomat:ci)"
+          trap 'docker rm -f "$cid" >/dev/null' EXIT
+          body=""
+          for _ in $(seq 1 20); do
+            body="$(curl -fsS http://127.0.0.1:18080/health)" && break
+            sleep 1
+          done
+          echo "health: ${body:-<no response>}"
+          expected="$(jq -r .version app/package.json)"
+          jq -e --arg v "$expected" '.status == "ok" and .version == $v' <<<"$body" >/dev/null \
+            || { docker logs "$cid"; echo "::error::/health did not return ok/$expected"; exit 1; }
+
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: app
+          file: deploy/Dockerfile
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: ${{ steps.name.outputs.name }}:sha-${{ github.sha }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+
+      # Deploy by digest, not by tag: production gets exactly the bytes that were tested here.
+      - name: Image reference
+        id: ref
+        env:
+          NAME: ${{ steps.name.outputs.name }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::unexpected digest '$DIGEST'"; exit 1; }
+          echo "image=${NAME}@${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "Image: ${NAME}@${DIGEST}" >> "$GITHUB_STEP_SUMMARY"
+
+  deploy:
+    name: Deploy to production
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20 # waiting for approval does not count here
+    # The job waits until a reviewer of the `production` environment approves it.
+    environment:
+      name: production
+    # One deploy at a time; a new one waits for the current one instead of interrupting it.
+    concurrency:
+      group: production-deploy
+      cancel-in-progress: false
+    permissions:
+      contents: read  # deploy/compose.yaml from the repository
+      packages: read  # the VM pulls the image with this job's token
+    env:
+      DEPLOY_DIR: /opt/poshtomat
+      IMAGE: ${{ needs.build.outputs.image }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          sparse-checkout: deploy
+
+      - name: Configure SSH
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_KNOWN_HOSTS: ${{ secrets.DEPLOY_KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          for v in DEPLOY_HOST DEPLOY_USER DEPLOY_SSH_KEY DEPLOY_KNOWN_HOSTS; do
+            [ -n "${!v}" ] || { echo "::error::secret $v is not set in the production environment"; exit 1; }
+          done
+          umask 077
+          d="$RUNNER_TEMP/ssh"; mkdir -p "$d"
+          printf '%s\n' "$DEPLOY_SSH_KEY"     > "$d/id"
+          printf '%s\n' "$DEPLOY_KNOWN_HOSTS" > "$d/known_hosts"
+          cat > "$d/config" <<EOF
+          Host prod
+            HostName $DEPLOY_HOST
+            User $DEPLOY_USER
+            IdentityFile $d/id
+            IdentitiesOnly yes
+            UserKnownHostsFile $d/known_hosts
+            StrictHostKeyChecking yes
+            BatchMode yes
+            ConnectTimeout 15
+            ServerAliveInterval 15
+            ControlMaster auto
+            ControlPath $d/cm-%C
+            ControlPersist 5m
+          EOF
+          echo "SSH_CFG=$d/config" >> "$GITHUB_ENV"
+
+      - name: Prepare .env
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SMS_TOKEN: ${{ secrets.SMS_TOKEN }}
+        run: |
+          set -euo pipefail
+          for v in IMAGE DATABASE_URL SMS_TOKEN; do
+            val="${!v}"
+            [ -n "$val" ] || { echo "::error::$v is empty"; exit 1; }
+            # Values are written in single quotes (literal for compose): no ' and no newlines.
+            case "$val" in *"'"*|*$'\n'*|*$'\r'*)
+              echo "::error::$v contains ' or a newline"; exit 1;;
+            esac
+          done
+          umask 077
+          {
+            echo "# Written by the pipeline (${GITHUB_REPOSITORY}@${GITHUB_SHA}, run ${GITHUB_RUN_ID}). Do not edit by hand."
+            printf "POSHTOMAT_IMAGE='%s'\n" "$IMAGE"
+            printf "DATABASE_URL='%s'\n"    "$DATABASE_URL"
+            printf "SMS_TOKEN='%s'\n"       "$SMS_TOKEN"
+          } > "$RUNNER_TEMP/release.env"
+
+      - name: Upload files to the VM
+        run: |
+          set -euo pipefail
+          ssh -F "$SSH_CFG" prod "install -d -m 700 $(printf %q "$DEPLOY_DIR")"
+          scp -F "$SSH_CFG" -q deploy/compose.yaml      "prod:$DEPLOY_DIR/compose.yaml.new"
+          scp -F "$SSH_CFG" -q "$RUNNER_TEMP/release.env" "prod:$DEPLOY_DIR/.env.new"
+          rm -f "$RUNNER_TEMP/release.env"
+
+      - name: Log in to GHCR on the VM (short-lived token)
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          printf '%s' "$GHCR_TOKEN" | ssh -F "$SSH_CFG" prod \
+            "docker login ghcr.io -u $(printf %q "$GITHUB_ACTOR") --password-stdin" >/dev/null
+
+      - name: Roll out (with rollback on failure)
+        run: |
+          set -euo pipefail
+          ssh -F "$SSH_CFG" prod "bash -s -- $(printf %q "$DEPLOY_DIR") $(printf %q "$IMAGE")" <<'REMOTE'
+          set -euo pipefail
+          cd "$1"
+          want_image="$2"
+
+          # Validate the new files and pull the images while the running release's files are still in place:
+          # if either fails, set -e stops here, .env and compose.yaml on disk still match the running
+          # containers, and the Clean up step removes .env.new.
+          docker compose -f compose.yaml.new --env-file .env.new config --quiet
+          docker compose -f compose.yaml.new --env-file .env.new pull --quiet api worker
+
+          # Save the current release so we can roll back to it.
+          rm -f .env.prev compose.yaml.prev
+          [ -f .env ]         && cp -p .env .env.prev
+          [ -f compose.yaml ] && cp -p compose.yaml compose.yaml.prev
+          install -m 600 .env.new .env && rm -f .env.new
+          mv -f compose.yaml.new compose.yaml
+
+          # Start everything, then wait for the api to become healthy and check the worker is running.
+          # Not a plain `up --wait`: it exits 1 on a service whose healthcheck is disabled (the worker
+          # has no HTTP server), so every deploy would roll back. Found in Task E, Docker Compose v2.33.
+          # The worker has no healthcheck and restarts on crash (restart: unless-stopped), so a single
+          # `ps --status running` can catch it between two crashes. Require it to be running at the start
+          # of a 30 s window (not waiting in a restart back-off) and to stay running with no restarts in it.
+          # State and restart count are read together, so the start snapshot is consistent.
+          worker_stable() {
+            local id before after
+            id="$(docker compose ps -q worker)"
+            [ -n "$id" ] || { echo "::error::worker container not found"; return 1; }
+            before="$(docker inspect -f '{{.State.Status}} {{.RestartCount}}' "$id")" || return 1
+            [ "${before%% *}" = running ] \
+              || { echo "::error::worker is not running (status, restarts: $before)"; return 1; }
+            sleep 30
+            after="$(docker inspect -f '{{.State.Status}} {{.RestartCount}}' "$id")" || return 1
+            [ "$after" = "$before" ] \
+              || { echo "::error::worker is not running steadily (status, restarts: $before → $after)"; return 1; }
+          }
+
+          start_and_wait() {
+            docker compose up -d --remove-orphans \
+              && docker compose up -d --wait --wait-timeout 120 --no-recreate api \
+              && worker_stable
+          }
+
+          rollback() {
+            echo "::error::new release did not become healthy; rolling back"
+            docker compose ps || true
+            docker compose logs --no-color --tail 100 api worker || true
+            if [ -f .env.prev ] && [ -f compose.yaml.prev ]; then
+              mv -f .env.prev .env
+              mv -f compose.yaml.prev compose.yaml
+              start_and_wait \
+                && echo "previous release restored" \
+                || echo "::error::rollback did not become healthy either — manual intervention needed"
+            else
+              echo "::error::no previous release (.env.prev) to roll back to"
+            fi
+            exit 1
+          }
+
+          start_and_wait || rollback
+
+          # Make sure exactly the image we built is running.
+          for svc in api worker; do
+            running="$(docker inspect -f '{{.Config.Image}}' "$(docker compose ps -q "$svc")")"
+            [ "$running" = "$want_image" ] || { echo "::error::$svc runs $running"; rollback; }
+          done
+
+          # The old release (and its secrets) is no longer needed on disk; the previous image
+          # digest can always be found in the history of this workflow's runs.
+          rm -f .env.prev compose.yaml.prev
+          # Unused images older than 30 days: keep the disk from filling up, keep recent releases for manual rollback.
+          docker image prune -af --filter "until=720h" >/dev/null || true
+          docker compose ps
+          echo "health: $(docker compose exec -T api node -e "fetch('http://127.0.0.1:8080/health').then(r=>r.text()).then(console.log)")"
+          REMOTE
+          echo "Deployed \`$IMAGE\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Clean up
+        if: always()
+        run: |
+          if [ -n "${SSH_CFG:-}" ] && [ -f "$SSH_CFG" ]; then
+            ssh -F "$SSH_CFG" prod "docker logout ghcr.io; rm -f $(printf %q "$DEPLOY_DIR")/.env.new" >/dev/null 2>&1 || true
+            ssh -F "$SSH_CFG" -O exit prod >/dev/null 2>&1 || true
+          fi
+          rm -rf "$RUNNER_TEMP/ssh" "$RUNNER_TEMP/release.env"

@@ -379,6 +379,33 @@ function oneShot(svc) {
   return String(svc?.restart ?? "") === "no" || svc?.deploy?.restart_policy?.condition === "none";
 }
 
+// C5: the variables the app reads (app/src/config.js) vs. the ones compose passes to it.
+export const APP_CONFIG = "app/src/config.js";
+
+// Read by Node.js or the OS, not by config.js; passing them is not a mistake.
+export const RUNTIME_ENV = new Set([
+  "TZ", "LANG", "LC_ALL", "NODE_ENV", "NODE_OPTIONS", "NODE_EXTRA_CA_CERTS",
+  "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY",
+]);
+
+/** Variable names config.js reads: env.NAME and env["NAME"]. */
+export function configVars(text) {
+  const names = new Set();
+  for (const m of text.matchAll(/\benv\.([A-Za-z_][A-Za-z0-9_]*)|\benv\[\s*["']([A-Za-z_][A-Za-z0-9_]*)["']\s*\]/g)) {
+    names.add(m[1] ?? m[2]);
+  }
+  return names;
+}
+
+// Services that run this app: built from the repo, or the poshtomat image. Third-party
+// services (a database, a proxy) have their own variables and are not checked.
+const isAppService = (svc) => Boolean(svc?.build) || /poshtomat/i.test(String(svc?.image ?? ""));
+// An image from a variable (${APP_IMAGE} or $APP_IMAGE) can be the app under a neutral name: if no app
+// service is recognised, these must not let the rule switch itself off silently. `$$` is compose's
+// escape for a literal `$`, not a variable.
+const imageFromVariable = (svc) =>
+  !svc?.build && /\$(\{|[A-Za-z_])/.test(String(svc?.image ?? "").replaceAll("$$", ""));
+
 export const RULES = [
   {
     id: "D1",
@@ -530,6 +557,45 @@ export const RULES = [
         }
       }
       return problems.length ? fail(problems.join("; ")) : pass("секретоподібні змінні задано посиланнями");
+    },
+  },
+  {
+    id: "C5",
+    title: "Змінні в compose збігаються з тими, що читає застосунок",
+    hint: "Кожна змінна в environment сервісу застосунку має читатися в app/src/config.js (або бути змінною середовища виконання: TZ, NODE_ENV…), а кожна змінна, яку читає config.js, має бути задана хоча б в одному сервісі. Інакше застосунок мовчки бере типове значення для локальної розробки — так 14.10 пул БД став 4 замість 20 після перейменування DB_POOL_MAX → DB_POOL_SIZE. Перейменовуєте змінну — міняйте config.js і compose.yaml в одному релізі.",
+    check({ root, compose }) {
+      const configPath = join(root, APP_CONFIG);
+      if (!existsSync(configPath)) return skip(`${APP_CONFIG} не знайдено — немає з чим порівнювати`);
+      const problem = composeProblem(compose);
+      if (problem) return problem;
+      const expected = configVars(readFileSync(configPath, "utf8"));
+      // config.js exists, so finding nothing means the rule no longer understands how it reads
+      // variables (destructuring, process.env[name]) — not that there is nothing to check.
+      if (!expected.size) return fail(`${APP_CONFIG} існує, але правило не знайшло в ньому жодного env.NAME / env["NAME"] — читайте змінні так або оновіть configVars()`);
+      const all = services(compose);
+      const apps = all.filter(([, svc]) => isAppService(svc));
+      if (!apps.length) {
+        const unknown = all.filter(([, svc]) => imageFromVariable(svc)).map(([name, svc]) => `${name} (${svc.image})`);
+        if (unknown.length) return fail(`не можу визначити сервіси застосунку: образ зі змінної в ${unknown.join(", ")} — назвіть змінну з poshtomat або додайте build:`);
+        return skip("у compose немає сервісів застосунку (build: або образ poshtomat)");
+      }
+
+      const problems = [];
+      const provided = new Set();
+      for (const [name, svc] of apps) {
+        for (const [key] of envEntries(svc?.environment)) {
+          provided.add(key);
+          if (!expected.has(key) && !RUNTIME_ENV.has(key)) problems.push(`${name}: ${key} застосунок не читає`);
+        }
+      }
+      // With env_file the full set of variables is not visible here: report only the unknown ones.
+      if (!apps.some(([, svc]) => svc?.env_file)) {
+        const missing = [...expected].filter((v) => !provided.has(v));
+        if (missing.length) problems.push(`не задано в жодному сервісі (код візьме типове значення): ${missing.join(", ")}`);
+      }
+      return problems.length
+        ? fail(problems.join("; "))
+        : pass(`усі ${expected.size} змінних з ${APP_CONFIG} задано, зайвих немає (сервіси: ${apps.map(([n]) => n).join(", ")})`);
     },
   },
   {

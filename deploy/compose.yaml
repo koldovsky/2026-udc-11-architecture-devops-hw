@@ -1,35 +1,106 @@
-# Поштомат громади — продакшн на одній VM (docker compose up -d).
-# PostgreSQL працює на самій VM, поза compose.
+# Community Parcel Locker — production on a single VM.
+# PostgreSQL runs on the VM itself, outside compose.
+#
+# Deployment is done by the pipeline (pipeline/deploy.yml). Next to this file on the VM
+# it puts a `.env` (mode 600) with:
+#   POSHTOMAT_IMAGE=ghcr.io/<owner>/<repo>/poshtomat@sha256:...   — an immutable digest, not :latest
+#   DATABASE_URL=postgres://poshtomat:<password>@192.0.2.10:5432/poshtomat
+#   SMS_TOKEN=<token>
+# Compose reads `.env` automatically; a missing variable stops `up` with an error
+# instead of starting with an empty token / the default localhost database.
+#
+# Manual run (from this directory):  docker compose up -d && docker compose up -d --wait --no-recreate api
+#   (a plain `up --wait` exits 1: the worker's healthcheck is disabled)
+# Nightly job (cron on the VM):     docker compose --profile jobs run --rm expire
+
+name: poshtomat
+
+x-hardening: &hardening
+  image: ${POSHTOMAT_IMAGE:?POSHTOMAT_IMAGE is not set (.env next to compose.yaml)}
+  init: true                      # tini as PID 1: signal forwarding and zombie reaping
+  read_only: true                 # the code writes nothing to disk
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,size=16m
+  cap_drop: [ALL]                 # no capabilities are needed (port 8080 > 1024)
+  security_opt:
+    - no-new-privileges:true
+  logging:                        # without rotation, json-file logs will eventually fill the disk
+    driver: json-file
+    options:
+      max-size: "20m"
+      max-file: "5"
+
+x-base-env: &base-env
+  TZ: "Europe/Kyiv"
+  LOG_LEVEL: "info"
+  DATABASE_URL: ${DATABASE_URL:?DATABASE_URL is not set}
+  DB_POOL_MAX: "20"
+  DB_POOL_WAIT_MS: "2000"
+
 services:
   api:
-    image: poshtomat:latest
-    build:
-      context: ../app
-      dockerfile: ../deploy/Dockerfile
+    <<: *hardening
+    restart: unless-stopped
     ports:
+      # Exposed on all VM interfaces, as before. Note: Docker bypasses ufw/iptables INPUT
+      # rules. If there is a TLS reverse proxy on the VM, change this to "127.0.0.1:8080:8080".
       - "8080:8080"
     environment:
-      TZ: "Europe/Kyiv"
+      <<: *base-env
       PORT: "8080"
-      LOG_LEVEL: "info"
-      DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
-      DB_POOL_MAX: "20"
-      DB_POOL_WAIT_MS: "2000"
-      SMS_BASE_URL: "https://sms.example.net/api/v2"
-      SMS_TOKEN: "CHANGE_ME"
-      SMS_RATE_PER_SEC: "20"
+      # The API does not send SMS — it does not get SMS_TOKEN.
+      # COURIER_BASE_URL is kept for an existing cron of the form
+      # `docker compose run api node bin/expire-parcels.js`; new cron jobs should use the `expire` service.
       COURIER_BASE_URL: "https://courier.example.com/api/v1"
+    # Health check: HEALTHCHECK from the image (GET /health). The api must not disable it.
+    stop_grace_period: 15s
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+          pids: 256
 
   worker:
-    image: poshtomat:latest
+    <<: *hardening
+    restart: unless-stopped
     command: ["node", "src/worker.js"]
     environment:
-      TZ: "Europe/Kyiv"
-      LOG_LEVEL: "info"
-      DATABASE_URL: "postgres://poshtomat@192.0.2.10:5432/poshtomat"
-      DB_POOL_MAX: "20"
-      DB_POOL_WAIT_MS: "2000"
+      <<: *base-env
       SMS_BASE_URL: "https://sms.example.net/api/v2"
-      SMS_TOKEN: "CHANGE_ME"
+      SMS_TOKEN: ${SMS_TOKEN:?SMS_TOKEN is not set}
       SMS_RATE_PER_SEC: "20"
+    # The worker has no HTTP server, so the image's HTTP HEALTHCHECK would always mark it unhealthy.
+    # There is no health signal to check without changing app/, so the check is off. The worker
+    # publishes no ports; if the process exits, restart: unless-stopped brings it back.
+    healthcheck:
+      disable: true
+    # After SIGTERM the worker finishes the current batch (up to 50 SMS at 20/s + retries)
+    # and/or waits out the 10 s pause; the default 10 s would SIGKILL it mid-send.
+    stop_grace_period: 45s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+          pids: 256
+
+  # Nightly expiry job. Not started by `up` (profile `jobs`), only via `run --rm`.
+  expire:
+    <<: *hardening
+    profiles: [jobs]
+    restart: "no"
+    command: ["node", "bin/expire-parcels.js"]
+    healthcheck:
+      disable: true               # one-shot job, no HTTP server
+
+    environment:
+      <<: *base-env
+      DB_POOL_MAX: "2"
       COURIER_BASE_URL: "https://courier.example.com/api/v1"
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+          pids: 256
